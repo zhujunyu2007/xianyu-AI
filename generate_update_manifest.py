@@ -3,7 +3,7 @@
 更新清单生成工具
 
 此脚本用于生成更新清单，包含所有可更新文件的MD5哈希值和大小信息。
-生成的清单可用于 GitHub Releases + tag 文件热更新方案。
+生成的清单可用于 Gitee/GitHub Releases + tag 文件热更新方案。
 
 使用方法：
     python generate_update_manifest.py
@@ -22,8 +22,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
-DEFAULT_GITHUB_OWNER = "GuDong2003"
-DEFAULT_GITHUB_REPO = "xianyu-auto-reply-fix"
+DEFAULT_UPDATE_PROVIDER = "gitee"
+DEFAULT_GITHUB_OWNER = "zhong-tony"
+DEFAULT_GITHUB_REPO = "xianyu-auto-reply-team"
+DEFAULT_GITEE_OWNER = "zhong-tony"
+DEFAULT_GITEE_REPO = "xianyu-auto-reply-team"
 
 # static 目录下允许热更新的静态资源类型
 STATIC_ASSET_EXTENSIONS = {
@@ -59,11 +62,9 @@ EXCLUDED_DIR_NAMES = {
     'nginx',
     'node_modules',
     'qr_screenshots',
-    'tests',
     'trajectory_history',
     'update_backup',
     'uploads',
-    'userscripts',
     'venv',
 }
 
@@ -119,9 +120,6 @@ def is_excluded_path(relative_path: Path) -> bool:
         return True
 
     if relative_path.name in EXCLUDED_FILE_NAMES:
-        return True
-
-    if relative_path.suffix.lower() == '.html' and 'preview' in relative_path.stem.lower():
         return True
 
     return any(part in EXCLUDED_DIR_NAMES for part in relative_path.parts)
@@ -202,8 +200,11 @@ def load_manifest_from_tag(base_dir: Path, tag: Optional[str]) -> Optional[Dict[
     if not tag:
         return None
 
-    owner, repo = read_repo_config()
-    manifest_url = f"https://github.com/{owner}/{repo}/releases/download/{tag}/update_files.json"
+    provider, owner, repo = read_repo_config()
+    if provider == "gitee":
+        manifest_url = f"https://gitee.com/{owner}/{repo}/releases/download/{tag}/update_files.json"
+    else:
+        manifest_url = f"https://github.com/{owner}/{repo}/releases/download/{tag}/update_files.json"
     token = (
         os.getenv('UPDATE_GITHUB_TOKEN')
         or os.getenv('GITHUB_TOKEN')
@@ -253,11 +254,6 @@ def extract_manifest_paths(entries: List[Any]) -> Set[str]:
     return paths
 
 
-def should_include_deleted_path(path: str) -> bool:
-    """判断删除清单中是否应包含该路径"""
-    return not is_excluded_path(Path(normalize_manifest_path(path)))
-
-
 def build_deleted_files(current_paths: Set[str], previous_manifest: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """基于历史 manifest 生成累积删除列表"""
     if not previous_manifest:
@@ -265,8 +261,7 @@ def build_deleted_files(current_paths: Set[str], previous_manifest: Optional[Dic
 
     previous_paths = extract_manifest_paths(previous_manifest.get('files', []))
     historical_deleted_paths = extract_manifest_paths(previous_manifest.get('deleted_files', []))
-    candidate_deleted_paths = (historical_deleted_paths | (previous_paths - current_paths)) - current_paths
-    deleted_paths = sorted(path for path in candidate_deleted_paths if should_include_deleted_path(path))
+    deleted_paths = sorted((historical_deleted_paths | (previous_paths - current_paths)) - current_paths)
 
     return [
         {
@@ -278,9 +273,11 @@ def build_deleted_files(current_paths: Set[str], previous_manifest: Optional[Dic
     ]
 
 
-def build_raw_download_url(owner: str, repo: str, version: str, relative_path: str) -> str:
-    """构建 GitHub raw 文件下载地址"""
+def build_raw_download_url(owner: str, repo: str, version: str, relative_path: str, provider: str = DEFAULT_UPDATE_PROVIDER) -> str:
+    """构建 raw 文件下载地址"""
     relative_path = relative_path.replace('\\', '/').lstrip('/')
+    if provider == 'gitee':
+        return f"https://gitee.com/{owner}/{repo}/raw/{version}/{relative_path}"
     return f"https://raw.githubusercontent.com/{owner}/{repo}/{version}/{relative_path}"
 
 
@@ -294,20 +291,29 @@ def read_version(base_dir: Path, fallback: str = "v1.0.0") -> str:
     return fallback
 
 
-def read_repo_config() -> tuple[str, str]:
-    """读取 GitHub 仓库配置，优先环境变量，其次默认值"""
+def read_repo_config() -> tuple[str, str, str]:
+    """读取仓库配置，优先环境变量，其次默认值"""
+    provider = os.environ.get("UPDATE_PROVIDER", DEFAULT_UPDATE_PROVIDER).strip().lower()
+    if provider not in {"gitee", "github"}:
+        provider = DEFAULT_UPDATE_PROVIDER
+
+    if provider == "gitee":
+        owner = os.environ.get("UPDATE_GITEE_OWNER", DEFAULT_GITEE_OWNER).strip()
+        repo = os.environ.get("UPDATE_GITEE_REPO", DEFAULT_GITEE_REPO).strip()
+        return provider, owner, repo
+
     owner = os.environ.get("UPDATE_GITHUB_OWNER", "").strip()
     repo = os.environ.get("UPDATE_GITHUB_REPO", "").strip()
     if owner and repo:
-        return owner, repo
+        return provider, owner, repo
 
     repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
     if repository and "/" in repository:
         repo_owner, repo_name = repository.split("/", 1)
         if repo_owner and repo_name:
-            return repo_owner, repo_name
+            return provider, repo_owner, repo_name
 
-    return DEFAULT_GITHUB_OWNER, DEFAULT_GITHUB_REPO
+    return provider, DEFAULT_GITHUB_OWNER, DEFAULT_GITHUB_REPO
 
 
 def generate_manifest(
@@ -315,6 +321,7 @@ def generate_manifest(
     version: str = "v1.0.0",
     owner: str = DEFAULT_GITHUB_OWNER,
     repo: str = DEFAULT_GITHUB_REPO,
+    provider: str = DEFAULT_UPDATE_PROVIDER,
     previous_manifest: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """生成更新清单"""
@@ -330,7 +337,7 @@ def generate_manifest(
             'path': file_path.replace('\\', '/'),
             'md5': md5,
             'size': size,
-            'download_url': build_raw_download_url(owner, repo, version, file_path),
+                'download_url': build_raw_download_url(owner, repo, version, file_path, provider),
             'requires_restart': needs_restart(file_path),
             'description': '',
         })
@@ -344,7 +351,7 @@ def generate_manifest(
         'description': f'版本 {version} 更新',
         'min_version': 'v1.0.0',
         'changelog': [
-            'GitHub Releases 热更新清单',
+            'Gitee/GitHub Releases 热更新清单',
         ],
         'files': files,
         'deleted_files': deleted_files,
@@ -382,7 +389,7 @@ def main():
     if len(sys.argv) > 2:
         version = sys.argv[2]
 
-    owner, repo = read_repo_config()
+    provider, owner, repo = read_repo_config()
     if len(sys.argv) > 3:
         owner = sys.argv[3]
     if len(sys.argv) > 4:
@@ -393,11 +400,11 @@ def main():
     
     print(f"项目目录: {base_dir}")
     print(f"版本号: {version}")
-    print(f"GitHub 仓库: {owner}/{repo}")
+    print(f"更新源: {provider} {owner}/{repo}")
     print(f"上一版本标签: {previous_tag or '无'}")
     
     # 生成清单
-    manifest = generate_manifest(base_dir, version, owner, repo, previous_manifest=previous_manifest)
+    manifest = generate_manifest(base_dir, version, owner, repo, provider, previous_manifest=previous_manifest)
     
     # 保存JSON文件
     output_file = base_dir / "update_files.json"
@@ -414,8 +421,8 @@ def main():
     print("""
 1. 修改业务 Python 文件、HTML 页面或 static/ 下的静态资源
 2. 更新 static/version.txt 为新的版本号后提交并 push 到 main
-3. GitHub Actions 会自动扫描可热更新文件，生成 update_files.json 并创建同名 Release
-4. 用户在前端点击"一键热更新"后，会先读取 GitHub Releases 最新版本，再从对应 tag 下载文件
+3. 发布时生成 update_files.json，并把它上传到同名 Release
+4. 用户在前端点击"一键热更新"后，会先读取 Gitee/GitHub Releases 最新版本，再从对应 tag 下载文件
 """)
 
 

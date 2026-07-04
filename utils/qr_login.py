@@ -118,6 +118,7 @@ class QRLoginManager:
                 'name': name,
                 'value': str(value),
                 'url': target_origin,
+                'path': '/',
             })
 
         return browser_cookies

@@ -505,6 +505,18 @@ class AIReplyEngine:
                     # openai / ollama / 空值 均走 chat/completions
                     reply = self._call_openai_chat_api(settings, messages, max_tokens=150, temperature=0.7)
 
+                if reply is None:
+                    logger.warning(f"AI未返回可发送内容 (账号: {cookie_id}, chat_id: {chat_id})")
+                    return None
+
+                if not isinstance(reply, str):
+                    reply = str(reply)
+
+                reply = reply.strip()
+                if not reply:
+                    logger.warning(f"AI返回空内容，跳过发送 (账号: {cookie_id}, chat_id: {chat_id})")
+                    return None
+
                 # 10. 保存AI回复到对话记录
                 self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent=None)
                 

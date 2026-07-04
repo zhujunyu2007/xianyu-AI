@@ -4,12 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>登录 - 闲鱼管理系统</title>
-  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="icon" type="image/svg+xml" href="/static/img/xianyu-logo.svg">
   <link rel="stylesheet" href="/static/lib/bootstrap/bootstrap.min.css">
   <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
   <style>
     :root {
-      --primary-color: #0d6efd;
+      --primary-color: #b7e7c8;
+      --primary-hover: #4f8f68;
+      --primary-ink: #173f2a;
       --secondary-color: #6c757d;
       --success-color: #198754;
       --danger-color: #dc3545;
@@ -17,7 +19,9 @@
     
     body {
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      background:
+        radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.6), transparent 22%),
+        linear-gradient(135deg, #edf9f1 0%, #d7f0df 48%, #b7e7c8 100%);
       min-height: 100vh;
       display: flex;
       align-items: center;
@@ -27,15 +31,15 @@
     .login-container {
       background: white;
       border-radius: 20px;
-      box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+      box-shadow: 0 24px 50px rgba(23, 63, 42, 0.18);
       overflow: hidden;
       width: 100%;
       max-width: 400px;
     }
     
     .login-header {
-      background: var(--primary-color);
-      color: white;
+      background: linear-gradient(135deg, #c8efd4, #86cfa0);
+      color: var(--primary-ink);
       padding: 30px;
       text-align: center;
     }
@@ -64,11 +68,12 @@
     
     .form-control:focus {
       border-color: var(--primary-color);
-      box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
+      box-shadow: 0 0 0 0.25rem rgba(183, 231, 200, 0.42);
     }
     
     .btn-login {
-      background: var(--primary-color);
+      background: linear-gradient(135deg, #c8efd4, #86cfa0);
+      color: var(--primary-ink);
       border: none;
       border-radius: 10px;
       padding: 12px;
@@ -79,8 +84,24 @@
     }
     
     .btn-login:hover {
-      background: #0b5ed7;
+      background: linear-gradient(135deg, #86cfa0, #4f8f68);
       transform: translateY(-2px);
+    }
+
+    .btn-outline-primary {
+      border-color: var(--primary-hover);
+      color: #2e6a45;
+    }
+
+    .btn-check:checked + .btn-outline-primary,
+    .btn-outline-primary:hover {
+      background: linear-gradient(135deg, #c8efd4, #86cfa0);
+      border-color: var(--primary-hover);
+      color: var(--primary-ink);
+    }
+
+    .text-primary {
+      color: #2e6a45 !important;
     }
     
     .input-group {
@@ -118,7 +139,7 @@
 <body>
   <div class="login-container">
     <div class="login-header">
-      <img src="/static/favicon.png" alt="Logo" height="64" class="mb-3">
+      <img src="/static/img/xianyu-logo.svg" alt="Xianyu" height="72" class="mb-3">
       <h2>欢迎登录</h2>
       <p>闲鱼管理系统</p>
     </div>

@@ -92,11 +92,16 @@ class UpdateProgress:
 class AutoUpdater:
     """自动更新器"""
 
-    # 默认 GitHub 更新源配置
+    # 默认更新源配置。当前项目默认走维护者自己的 Gitee 仓库，避免继续连接源作者更新。
+    DEFAULT_PROVIDER = "gitee"
     DEFAULT_GITHUB_API_BASE = "https://api.github.com"
     DEFAULT_GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
-    DEFAULT_GITHUB_OWNER = "GuDong2003"
-    DEFAULT_GITHUB_REPO = "xianyu-auto-reply-fix"
+    DEFAULT_GITEE_API_BASE = "https://gitee.com/api/v5"
+    DEFAULT_GITEE_RAW_BASE = "https://gitee.com"
+    DEFAULT_GITHUB_OWNER = "zhong-tony"
+    DEFAULT_GITHUB_REPO = "xianyu-auto-reply-team"
+    DEFAULT_GITEE_OWNER = "zhong-tony"
+    DEFAULT_GITEE_REPO = "xianyu-auto-reply-team"
     
     # 可热更新的静态文件类型（通常不需要重启）
     HOT_UPDATABLE_EXTENSIONS = {
@@ -143,6 +148,10 @@ class AutoUpdater:
                  github_owner: Optional[str] = None,
                  github_repo: Optional[str] = None,
                  github_token: Optional[str] = None,
+                 provider: Optional[str] = None,
+                 gitee_owner: Optional[str] = None,
+                 gitee_repo: Optional[str] = None,
+                 gitee_token: Optional[str] = None,
                  current_version: str = "1.0.0"):
         """
         初始化更新器
@@ -150,16 +159,27 @@ class AutoUpdater:
         Args:
             app_dir: 应用目录，默认为当前工作目录
             update_server: 兼容旧参数，保留但不再作为默认更新源
-            github_owner: GitHub 仓库 owner
-            github_repo: GitHub 仓库 repo
-            github_token: GitHub API Token（可选，用于提升限额）
+            provider: 更新源类型，支持 github / gitee
+            github_owner/github_repo/github_token: GitHub 更新源配置
+            gitee_owner/gitee_repo/gitee_token: Gitee 更新源配置
             current_version: 当前版本号
         """
         self.app_dir = Path(app_dir) if app_dir else Path.cwd()
+        self.provider = (provider or os.getenv("UPDATE_PROVIDER", self.DEFAULT_PROVIDER)).strip().lower()
+        if self.provider not in {"github", "gitee"}:
+            logger.warning(f"未知更新源 {self.provider}，已回退到 gitee")
+            self.provider = "gitee"
         self.github_owner = github_owner or os.getenv("UPDATE_GITHUB_OWNER", self.DEFAULT_GITHUB_OWNER)
         self.github_repo = github_repo or os.getenv("UPDATE_GITHUB_REPO", self.DEFAULT_GITHUB_REPO)
         self.github_token = (github_token or os.getenv("UPDATE_GITHUB_TOKEN", "")).strip()
-        self.update_server = update_server or f"{self.github_owner}/{self.github_repo}"
+        self.gitee_owner = gitee_owner or os.getenv("UPDATE_GITEE_OWNER", self.DEFAULT_GITEE_OWNER)
+        self.gitee_repo = gitee_repo or os.getenv("UPDATE_GITEE_REPO", self.DEFAULT_GITEE_REPO)
+        self.gitee_token = (
+            gitee_token
+            or os.getenv("UPDATE_GITEE_TOKEN", "")
+            or os.getenv("GITEE_TOKEN", "")
+        ).strip()
+        self.update_server = update_server or self._repo_slug()
         self.current_version = current_version
         self.backup_dir = self.app_dir / "update_backup"
         
@@ -172,7 +192,8 @@ class AutoUpdater:
         
         logger.info(
             "自动更新器初始化: "
-            f"app_dir={self.app_dir}, repo={self.github_owner}/{self.github_repo}, version={self.current_version}"
+            f"app_dir={self.app_dir}, provider={self.provider}, repo={self.update_server}, "
+            f"version={self.current_version}"
         )
     
     def add_progress_callback(self, callback: callable):
@@ -261,31 +282,81 @@ class AutoUpdater:
 
         return self.current_version
 
+    def _repo_slug(self) -> str:
+        if self.provider == "gitee":
+            return f"{self.gitee_owner}/{self.gitee_repo}"
+        return f"{self.github_owner}/{self.github_repo}"
+
     def _build_request_headers(self, accept_json: bool = True) -> Dict[str, str]:
-        """构建 GitHub 请求头"""
+        """构建更新源请求头"""
         headers = {
             "User-Agent": f"XianyuAutoReplyUpdater/{self.current_version}",
         }
-        if accept_json:
+        if accept_json and self.provider == "github":
             headers["Accept"] = "application/vnd.github+json"
-        if self.github_token:
+        if self.provider == "github" and self.github_token:
             headers["Authorization"] = f"Bearer {self.github_token}"
         return headers
 
     def _build_latest_release_url(self) -> str:
-        """构建 GitHub 最新 release API 地址"""
+        """构建最新 release API 地址"""
+        if self.provider == "gitee":
+            url = (
+                f"{self.DEFAULT_GITEE_API_BASE}/repos/"
+                f"{self.gitee_owner}/{self.gitee_repo}/releases/latest"
+            )
+            if self.gitee_token:
+                url += f"?access_token={self.gitee_token}"
+            return url
+
         return (
             f"{self.DEFAULT_GITHUB_API_BASE}/repos/"
             f"{self.github_owner}/{self.github_repo}/releases/latest"
         )
 
     def _build_raw_file_url(self, tag: str, relative_path: str) -> str:
-        """构建 GitHub raw 文件地址"""
+        """构建 raw 文件地址"""
         relative_path = relative_path.replace("\\", "/").lstrip("/")
+        if self.provider == "gitee":
+            url = (
+                f"{self.DEFAULT_GITEE_RAW_BASE}/"
+                f"{self.gitee_owner}/{self.gitee_repo}/raw/{tag}/{relative_path}"
+            )
+            if self.gitee_token:
+                url += f"?access_token={self.gitee_token}"
+            return url
+
         return (
             f"{self.DEFAULT_GITHUB_RAW_BASE}/"
             f"{self.github_owner}/{self.github_repo}/{tag}/{relative_path}"
         )
+
+    def _get_release_tag(self, release_data: Dict[str, Any]) -> str:
+        """兼容 GitHub / Gitee release 字段。"""
+        return str(
+            release_data.get("tag_name")
+            or release_data.get("tag")
+            or release_data.get("name")
+            or ""
+        ).strip()
+
+    def _get_release_assets(self, release_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        assets = release_data.get("assets") or release_data.get("attach_files") or []
+        return assets if isinstance(assets, list) else []
+
+    def _asset_name(self, asset: Dict[str, Any]) -> str:
+        return str(asset.get("name") or asset.get("filename") or asset.get("file_name") or "").strip()
+
+    def _asset_download_url(self, asset: Dict[str, Any]) -> Optional[str]:
+        url = (
+            asset.get("browser_download_url")
+            or asset.get("download_url")
+            or asset.get("url")
+        )
+        if url and self.provider == "gitee" and self.gitee_token and "access_token=" not in str(url):
+            separator = "&" if "?" in str(url) else "?"
+            url = f"{url}{separator}access_token={self.gitee_token}"
+        return url
 
     def _extract_changelog(self, release_data: Dict[str, Any]) -> List[str]:
         """从 release body 中提取简易更新日志"""
@@ -305,9 +376,9 @@ class AutoUpdater:
 
     def _find_asset_download_url(self, release_data: Dict[str, Any], asset_name: str) -> Optional[str]:
         """查找指定 release asset 的浏览器下载地址"""
-        for asset in release_data.get("assets", []) or []:
-            if asset.get("name") == asset_name:
-                return asset.get("browser_download_url")
+        for asset in self._get_release_assets(release_data):
+            if self._asset_name(asset) == asset_name:
+                return self._asset_download_url(asset)
         return None
     
     async def check_for_updates(self) -> Optional[UpdateManifest]:
@@ -329,15 +400,15 @@ class AutoUpdater:
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as response:
                     if response.status != 200:
-                        logger.warning(f"获取 GitHub Release 失败: HTTP {response.status}")
+                        logger.warning(f"获取 {self.provider} Release 失败: HTTP {response.status}")
                         self._update_progress(status=UpdateStatus.IDLE, message="检查更新失败")
                         return None
 
                     release_data = await response.json()
 
-                release_tag = (release_data.get("tag_name") or "").strip()
+                release_tag = self._get_release_tag(release_data)
                 if not release_tag:
-                    logger.warning("GitHub Release 缺少 tag_name，无法检查更新")
+                    logger.warning(f"{self.provider} Release 缺少 tag，无法检查更新")
                     self._update_progress(status=UpdateStatus.IDLE, message="检查更新失败")
                     return None
 
@@ -493,7 +564,11 @@ class AutoUpdater:
             文件内容，失败返回None
         """
         try:
-            async with session.get(file_update.download_url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            async with session.get(
+                file_update.download_url,
+                headers=self._build_request_headers(accept_json=False),
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
                 if response.status != 200:
                     logger.error(f"下载文件失败: {file_update.path}, HTTP {response.status}")
                     return None

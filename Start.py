@@ -154,6 +154,9 @@ def _check_and_install_playwright():
     except ImportError:
         print(f"{_WARN} Playwright模块未安装，跳过浏览器检查")
         return False
+
+    print(f"{_WARN} 跳过Playwright浏览器自动安装检查")
+    return True
     
     # 检查Playwright浏览器是否存在
     playwright_installed = False

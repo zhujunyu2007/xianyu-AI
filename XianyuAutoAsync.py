@@ -28,7 +28,7 @@ from config import (
 import sys
 import aiohttp
 from collections import defaultdict, deque
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from db_manager import db_manager
 from utils.notification_dispatcher import (
     build_face_verify_notification,
@@ -150,8 +150,11 @@ class InitAuthError(Exception):
 class AutoReplyPauseManager:
     """自动回复暂停管理器"""
     def __init__(self):
-        # 存储每个chat_id的暂停信息 {chat_id: pause_until_timestamp}
+        # 存储每个账号会话的暂停信息，避免不同账号共用同一 chat_id 时互相影响。
         self.paused_chats = {}
+
+    def _pause_key(self, chat_id: str, cookie_id: str) -> str:
+        return f"{cookie_id}:{chat_id}"
 
     def pause_chat(self, chat_id: str, cookie_id: str):
         """暂停指定chat_id的自动回复，使用账号特定的暂停时间"""
@@ -170,34 +173,37 @@ class AutoReplyPauseManager:
 
         pause_duration_seconds = pause_minutes * 60
         pause_until = time.time() + pause_duration_seconds
-        self.paused_chats[chat_id] = pause_until
+        pause_key = self._pause_key(chat_id, cookie_id)
+        self.paused_chats[pause_key] = pause_until
 
         # 计算暂停结束时间
         end_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pause_until))
         logger.info(f"【{cookie_id}】检测到手动发出消息，chat_id {chat_id} 自动回复暂停{pause_minutes}分钟，恢复时间: {end_time}")
 
-    def is_chat_paused(self, chat_id: str) -> bool:
+    def is_chat_paused(self, chat_id: str, cookie_id: str) -> bool:
         """检查指定chat_id是否处于暂停状态"""
-        if chat_id not in self.paused_chats:
+        pause_key = self._pause_key(chat_id, cookie_id)
+        if pause_key not in self.paused_chats:
             return False
 
         current_time = time.time()
-        pause_until = self.paused_chats[chat_id]
+        pause_until = self.paused_chats[pause_key]
 
         if current_time >= pause_until:
             # 暂停时间已过，移除记录
-            del self.paused_chats[chat_id]
+            del self.paused_chats[pause_key]
             return False
 
         return True
 
-    def get_remaining_pause_time(self, chat_id: str) -> int:
+    def get_remaining_pause_time(self, chat_id: str, cookie_id: str) -> int:
         """获取指定chat_id剩余暂停时间（秒）"""
-        if chat_id not in self.paused_chats:
+        pause_key = self._pause_key(chat_id, cookie_id)
+        if pause_key not in self.paused_chats:
             return 0
 
         current_time = time.time()
-        pause_until = self.paused_chats[chat_id]
+        pause_until = self.paused_chats[pause_key]
         remaining = max(0, int(pause_until - current_time))
 
         return remaining
@@ -205,11 +211,11 @@ class AutoReplyPauseManager:
     def cleanup_expired_pauses(self):
         """清理已过期的暂停记录"""
         current_time = time.time()
-        expired_chats = [chat_id for chat_id, pause_until in self.paused_chats.items()
+        expired_chats = [pause_key for pause_key, pause_until in self.paused_chats.items()
                         if current_time >= pause_until]
 
-        for chat_id in expired_chats:
-            del self.paused_chats[chat_id]
+        for pause_key in expired_chats:
+            del self.paused_chats[pause_key]
 
 
 # 全局暂停管理器实例
@@ -3230,33 +3236,12 @@ class XianyuLive:
             
             # 调用好评接口
             result = await self._call_comment_api(order_id, comment_content)
-            result_message = result.get("message", "未知错误")
-            batch_id = f"realtime_{int(time.time() * 1000)}"
-
-            try:
-                order_info = db_manager.get_order_by_id(order_id) or {}
-                db_manager.add_scheduled_rate_log(
-                    batch_id=batch_id,
-                    cookie_id=self.cookie_id,
-                    order_id=order_id,
-                    item_id=order_info.get('item_id'),
-                    buyer_id=order_info.get('buyer_id'),
-                    buyer_nick=order_info.get('buyer_nick'),
-                    comment=comment_content,
-                    status='success' if result.get('success') else ('cookie_expired' if result.get('session_expired') else 'failed'),
-                    message=result_message,
-                    raw_response=result.get('raw') or result,
-                )
-            except Exception as log_e:
-                logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 写入自动评价日志失败: {self._safe_str(log_e)}')
-
+            
             if result.get('success'):
-                db_manager.mark_order_rated(order_id, True)
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 订单 {order_id} 自动好评成功')
                 return True
             else:
-                db_manager.mark_order_rated(order_id, False, result_message)
-                logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ❌ 订单 {order_id} 自动好评失败: {result_message}')
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ❌ 订单 {order_id} 自动好评失败: {result.get("message", "未知错误")}')
                 return False
                 
         except Exception as e:
@@ -3276,27 +3261,61 @@ class XianyuLive:
             return None
 
     async def _call_comment_api(self, order_id: str, comment: str) -> dict:
-        """调用本地闲鱼评价接口。"""
+        """调用好评接口"""
+        import aiohttp
+        
         try:
-            from utils.rate_service import RateService
+            # 好评接口地址：从系统设置读取；未配置则拒绝调用，避免向未知第三方泄露 Cookie
+            comment_api_url = (db_manager.get_system_setting('auto_comment_api_url') or '').strip()
+            if not comment_api_url:
+                logger.warning(f"【{self.cookie_id}】未配置 auto_comment_api_url，跳过自动好评接口调用")
+                return {
+                    "success": False,
+                    "message": "未配置自动好评 API 地址，请在系统设置中填写后再启用此功能"
+                }
 
-            rate_service = RateService(self.cookies_str, account_id=self.cookie_id)
-            result = await rate_service.rate_buyer(order_id, comment)
-
-            # RateService 可能在令牌过期时合并 Set-Cookie 并保存到 DB；同步当前实例内存 Cookie。
-            refreshed_cookie = getattr(rate_service, 'cookie_string', None)
-            if refreshed_cookie and refreshed_cookie != self.cookies_str:
-                self.cookies_str = refreshed_cookie
-                self.cookies = trans_cookies(refreshed_cookie)
-                logger.info(f"【{self.cookie_id}】自动评价后已同步刷新 Cookie 到当前实例")
-
-            return result
+            # 获取当前账号的cookie
+            cookie_str = self.cookies_str
+            
+            payload = {
+                "cookie_str": cookie_str,
+                "order_id": order_id,
+                "comment": comment
+            }
+            
+            headers = {
+                "accept": "application/json",
+                "Content-Type": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(comment_api_url, json=payload, headers=headers, timeout=30) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return {
+                            "success": result.get("status") == "success",
+                            "message": result.get("message", "好评成功")
+                        }
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"【{self.cookie_id}】好评接口返回错误: status={response.status}, body={error_text}")
+                        return {
+                            "success": False,
+                            "message": f"接口返回错误: {response.status}"
+                        }
+                        
         except asyncio.TimeoutError:
             logger.error(f"【{self.cookie_id}】好评接口请求超时")
-            return {"success": False, "message": "请求超时"}
+            return {
+                "success": False,
+                "message": "请求超时"
+            }
         except Exception as e:
             logger.error(f"【{self.cookie_id}】调用好评接口异常: {self._safe_str(e)}")
-            return {"success": False, "message": str(e)}
+            return {
+                "success": False,
+                "message": str(e)
+            }
 
     def can_auto_delivery(self, order_id: str) -> bool:
         """检查是否可以进行自动发货（防重复发货）- 基于订单ID"""
@@ -5895,134 +5914,6 @@ class XianyuLive:
         window = window_seconds or self.slider_success_reentry_window
         return (time.time() - self.last_slider_success_at) <= window
 
-    @staticmethod
-    def _coerce_config_bool(value: Any, default: bool = False) -> bool:
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return default
-        text = str(value).strip().lower()
-        if text in {'1', 'true', 'yes', 'on'}:
-            return True
-        if text in {'0', 'false', 'no', 'off'}:
-            return False
-        return default
-
-    @classmethod
-    def _is_soft_auth_token_preflight_enabled(cls, source: str = '') -> bool:
-        enabled = cls._coerce_config_bool(
-            RISK_CONTROL.get('soft_auth_token_preflight_enabled', True),
-            True,
-        )
-        if not enabled:
-            return False
-
-        normalized_source = str(source or '').strip().lower()
-        if normalized_source.startswith('qr_login'):
-            # 扫码登录当前有稳定期保护，默认不主动请求 token；需要时可通过配置显式开启。
-            return cls._coerce_config_bool(
-                RISK_CONTROL.get('soft_auth_token_preflight_qr_enabled', False),
-                False,
-            )
-        return True
-
-    @staticmethod
-    def _get_soft_auth_token_preflight_timeout() -> float:
-        try:
-            timeout = float(RISK_CONTROL.get('soft_auth_token_preflight_timeout_seconds', 5.0) or 5.0)
-        except (TypeError, ValueError):
-            timeout = 5.0
-        return max(2.0, min(timeout, 15.0))
-
-    async def soft_preflight_token_after_auth(
-        self,
-        cookie_string: str = None,
-        source: str = 'auth_success',
-        proxy: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """认证成功后的轻量 token 软预检。
-
-        该方法只做观测与 token 预热：网络失败、超时、未知响应都不会阻断既有登录/刷新流程。
-        默认也不会在扫码登录稳定期内主动触发，避免破坏当前风控保护策略。
-        """
-        normalized_source = str(source or 'auth_success').strip() or 'auth_success'
-        if not self._is_soft_auth_token_preflight_enabled(normalized_source):
-            return {
-                'status': 'skipped',
-                'source': normalized_source,
-                'reason': 'disabled_by_config',
-                'token_cached': False,
-            }
-
-        target_cookie_string = str(cookie_string or self.cookies_str or '').strip()
-        if not target_cookie_string:
-            logger.warning(f"【{self.cookie_id}】{normalized_source} 软Token预检跳过：Cookie为空")
-            return {
-                'status': 'skipped',
-                'source': normalized_source,
-                'reason': 'empty_cookie',
-                'token_cached': False,
-            }
-
-        timeout = self._get_soft_auth_token_preflight_timeout()
-        try:
-            from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
-
-            logger.info(
-                f"【{self.cookie_id}】开始{normalized_source}软Token预检，timeout={timeout:.1f}s（失败不阻断原流程）"
-            )
-            probe_result = await asyncio.to_thread(
-                probe_cookie_verification_from_cookie,
-                target_cookie_string,
-                proxy if proxy is not None else self.proxy_config,
-                timeout,
-            )
-        except Exception as preflight_err:
-            logger.warning(
-                f"【{self.cookie_id}】{normalized_source}软Token预检未完成，不阻断原流程: {self._safe_str(preflight_err)}"
-            )
-            return {
-                'status': 'inconclusive',
-                'source': normalized_source,
-                'reason': self._safe_str(preflight_err),
-                'token_cached': False,
-            }
-
-        status = str(probe_result.get('status') or 'unknown')
-        verification_url = str(probe_result.get('verification_url') or '').strip()
-        token_cached = False
-        if status == 'cookie_valid':
-            data_payload = (probe_result.get('payload') or {}).get('data') or {}
-            access_token = str(data_payload.get('accessToken') or '').strip()
-            if access_token:
-                self.cache_auth_prewarmed_token(
-                    self.cookie_id,
-                    access_token,
-                    source=f'soft_preflight:{normalized_source}',
-                )
-                token_cached = True
-            logger.info(
-                f"【{self.cookie_id}】{normalized_source}软Token预检通过"
-                f"{'，已缓存预热token' if token_cached else ''}"
-            )
-        elif status == 'verification_required':
-            logger.warning(
-                f"【{self.cookie_id}】{normalized_source}软Token预检返回验证要求，不阻断原流程: {verification_url or '无URL'}"
-            )
-        else:
-            logger.warning(
-                f"【{self.cookie_id}】{normalized_source}软Token预检结果未知(status={status})，不阻断原流程"
-            )
-
-        return {
-            'status': status,
-            'source': normalized_source,
-            'verification_url': verification_url,
-            'token_cached': token_cached,
-            'success_ret': bool(probe_result.get('success_ret')),
-            'has_token_payload': bool(probe_result.get('has_token_payload')),
-        }
-
     async def preflight_token_after_manual_refresh(self) -> str:
         """手动刷新成功后的 token 预检，确认新实例可直接完成初始化。
 
@@ -7152,12 +7043,6 @@ class XianyuLive:
                 self._set_runtime_cookie_state(
                     cookies_str=new_cookies_str,
                     cookies_dict=new_cookies_dict,
-                    source="password_login_refresh",
-                )
-
-                # 认证成功后的轻量 Token 软预检：只用于观测/预热，不阻断原有更新与重启流程
-                await self.soft_preflight_token_after_auth(
-                    new_cookies_str,
                     source="password_login_refresh",
                 )
 
@@ -9101,11 +8986,16 @@ class XianyuLive:
                 skip_wait=True  # 跳过内部等待，因为外部已实现防抖
             )
 
+            if isinstance(reply, str):
+                reply = reply.strip()
+
             if reply:
                 logger.info(f"【{self.cookie_id}】AI回复生成成功: {reply}")
                 return reply
             else:
-                logger.warning(f"AI回复生成失败")
+                logger.warning(
+                    f"【{self.cookie_id}】AI未生成可发送内容: chat_id={chat_id}, item_id={item_id}, buyer_id={send_user_id}"
+                )
                 return None
 
         except Exception as e:
@@ -11952,14 +11842,16 @@ class XianyuLive:
             }
         }
         text_base64 = str(base64.b64encode(json.dumps(text).encode('utf-8')), 'utf-8')
+        outgoing_mid = generate_mid()
+        outgoing_uuid = generate_uuid()
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
-                "mid": generate_mid()
+                "mid": outgoing_mid
             },
             "body": [
                 {
-                    "uuid": generate_uuid(),
+                    "uuid": outgoing_uuid,
                     "cid": f"{cid}@goofish",
                     "conversationType": 1,
                     "content": {
@@ -11988,7 +11880,13 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        logger.info(f"【{self.cookie_id}】准备发送文本消息: chat_id={cid}, to={toid}, mid={outgoing_mid}")
+        try:
+            await ws.send(json.dumps(msg))
+            logger.info(f"【{self.cookie_id}】文本消息已提交到WebSocket: chat_id={cid}, to={toid}, mid={outgoing_mid}")
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】文本消息发送异常: chat_id={cid}, to={toid}, mid={outgoing_mid}, error={self._safe_str(e)}")
+            raise
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -12210,6 +12108,226 @@ class XianyuLive:
             )
 
         return await self.list_all_conversations(cid, page_size=page_size)
+
+    def _extract_candidate_chat_ids_from_sync_hint(self, message: dict) -> List[str]:
+        """从缺正文的同步提示包中提取可能的会话 ID。"""
+        candidates = []
+
+        def visit(value):
+            if isinstance(value, str):
+                text = value.strip()
+                if text.endswith('@goofish'):
+                    text = text.split('@')[0]
+                if text.isdigit() and 8 <= len(text) <= 12 and text not in candidates:
+                    candidates.append(text)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    visit(item)
+
+        try:
+            visit(message)
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】提取同步提示包会话ID失败: {self._safe_str(exc)}")
+        return candidates[:3]
+
+    def _history_record_created_ms(self, record: dict) -> int:
+        try:
+            value = record.get('created_at')
+            if value in (None, '', 0, '0'):
+                return 0
+            value = int(float(value))
+            return value * 1000 if value < 10**11 else value
+        except Exception:
+            return 0
+
+    def _extract_text_from_history_record(self, record: dict) -> str:
+        try:
+            message = record.get('message') if isinstance(record, dict) else {}
+            if isinstance(message, dict):
+                text_obj = message.get('text')
+                if isinstance(text_obj, dict):
+                    text = str(text_obj.get('text') or '').strip()
+                    if text:
+                        return text
+                for key in ('text', 'content', 'raw'):
+                    text = str(message.get(key) or '').strip()
+                    if text:
+                        return text
+
+            extension = record.get('message_extension') if isinstance(record, dict) else {}
+            if isinstance(extension, dict):
+                for key in ('reminderContent', 'detailNotice'):
+                    text = str(extension.get(key) or '').strip()
+                    if text:
+                        return text
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】解析历史消息文本失败: {self._safe_str(exc)}")
+        return ''
+
+    def _extract_item_id_from_history_record(self, record: dict) -> str:
+        try:
+            from urllib.parse import urlparse, parse_qs
+            extension = record.get('message_extension') if isinstance(record, dict) else {}
+            reminder_url = str((extension or {}).get('reminderUrl') or '').strip()
+            if reminder_url:
+                parsed = urlparse(reminder_url)
+                item_id = parse_qs(parsed.query or '').get('itemId', [None])[0]
+                if item_id:
+                    return str(item_id)
+        except Exception:
+            pass
+        return None
+
+    def _extract_message_id_from_history_record(self, record: dict) -> str:
+        try:
+            extension = record.get('message_extension') if isinstance(record, dict) else {}
+            for key in ('bizTag', 'extJson'):
+                parsed = self._load_json_dict((extension or {}).get(key, ''))
+                message_id = parsed.get('messageId') if isinstance(parsed, dict) else None
+                if message_id:
+                    return str(message_id)
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】解析历史消息ID失败: {self._safe_str(exc)}")
+        return None
+
+    def _has_local_inbound_message(self, chat_id: str, sender_id: str, content: str) -> bool:
+        try:
+            from db_manager import db_manager as _db
+            rows = _db.get_chat_messages(self.cookie_id, chat_id, limit=20) or []
+            for row in rows:
+                if (
+                    str(row.get('sender_id') or '') == str(sender_id or '')
+                    and str(row.get('content') or '') == str(content or '')
+                    and int(row.get('direction') or 0) == 2
+                ):
+                    return True
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】检查本地历史消息失败: {self._safe_str(exc)}")
+        return False
+
+    async def _try_handle_non_chat_sync_via_history(self, message: dict, message_data: dict, websocket, msg_id: str, msg_time: str) -> bool:
+        """同步包只带消息索引时，补拉最近历史并把最新买家消息送入自动回复链。"""
+        chat_ids = self._extract_candidate_chat_ids_from_sync_hint(message)
+        if not chat_ids:
+            return False
+
+        now_ms = int(time.time() * 1000)
+        sync_ts = 0
+        try:
+            raw_ts = message.get('5') if isinstance(message, dict) else 0
+            sync_ts = int(float(raw_ts or 0))
+            if sync_ts and sync_ts < 10**11:
+                sync_ts *= 1000
+        except Exception:
+            sync_ts = 0
+
+        for chat_id in chat_ids:
+            try:
+                throttle_key = f"{self.cookie_id}:{chat_id}"
+                throttle_map = getattr(self, '_history_recover_attempts', None)
+                if throttle_map is None:
+                    throttle_map = {}
+                    self._history_recover_attempts = throttle_map
+                last_attempt = throttle_map.get(throttle_key, 0)
+                if time.time() - last_attempt < 2:
+                    continue
+                throttle_map[throttle_key] = time.time()
+
+                history = await self.fetch_conversation_history_with_fallback(chat_id, page_size=6, isolated_timeout=8)
+                if not history:
+                    continue
+
+                candidates = []
+                for record in history:
+                    sender_id = str(record.get('send_user_id') or '').strip()
+                    if not sender_id or sender_id == str(self.myid):
+                        continue
+                    content = self._extract_text_from_history_record(record)
+                    if not content:
+                        continue
+                    created_ms = self._history_record_created_ms(record)
+                    if created_ms:
+                        if sync_ts and created_ms < sync_ts - 60000:
+                            continue
+                        if now_ms - created_ms > 5 * 60 * 1000:
+                            continue
+                    candidates.append((created_ms, record, sender_id, content))
+
+                if not candidates:
+                    continue
+
+                candidates.sort(key=lambda item: item[0] or 0, reverse=True)
+                created_ms, record, sender_id, content = candidates[0]
+                if self._has_local_inbound_message(chat_id, sender_id, content):
+                    logger.info(f"【{self.cookie_id}】[{msg_id}] 历史兜底命中已处理消息，跳过: chat_id={chat_id}, sender={sender_id}, content={content[:30]}")
+                    continue
+
+                sender_name = str(record.get('send_user_name') or '').strip() or sender_id
+                item_id = self._extract_item_id_from_history_record(record) or self.extract_item_id_from_message(message) or f"auto_{sender_id}_{int(time.time())}"
+                dedupe_message_id = self._extract_message_id_from_history_record(record) or f"history:{chat_id}:{sender_id}:{content}:{created_ms or int(time.time() * 1000)}"
+                logger.warning(
+                    f"【{self.cookie_id}】[{msg_id}] 同步包缺正文，已从历史补拉买家消息进入自动回复: "
+                    f"chat_id={chat_id}, sender={sender_id}, item={item_id}, content={content[:30]}"
+                )
+
+                try:
+                    from db_manager import db_manager as _db
+                    from chat_event_hub import publish_chat_message
+                    _msg_id_db = _db.save_chat_message(
+                        cookie_id=self.cookie_id,
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        sender_name=sender_name,
+                        content=content,
+                        content_type=1,
+                        image_url=None,
+                        item_id=item_id,
+                        direction=2,
+                        media_url=None,
+                        link_url=None,
+                        extra_json=None,
+                    )
+                    publish_chat_message(self.cookie_id, {
+                        'msg_id': _msg_id_db,
+                        'chat_id': chat_id,
+                        'sender_id': sender_id,
+                        'sender_name': sender_name,
+                        'content': content,
+                        'content_type': 1,
+                        'image_url': None,
+                        'item_id': item_id,
+                        'direction': 2,
+                        'media_url': None,
+                        'link_url': None,
+                        'extra_json': None,
+                    })
+                except Exception as save_exc:
+                    logger.debug(f"【{self.cookie_id}】[{msg_id}] 保存历史兜底消息失败: {self._safe_str(save_exc)}")
+
+                reply_time = time.strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                    time.localtime((created_ms or now_ms) / 1000),
+                )
+                await self._schedule_debounced_reply(
+                    chat_id=chat_id,
+                    message_data=message_data,
+                    websocket=websocket,
+                    send_user_name=sender_name,
+                    send_user_id=sender_id,
+                    send_message=content,
+                    item_id=item_id,
+                    msg_time=reply_time,
+                    dedupe_message_id=dedupe_message_id,
+                    dedupe_create_time=created_ms or now_ms,
+                )
+                self.last_user_chat_time = time.time()
+                return True
+            except Exception as exc:
+                logger.warning(f"【{self.cookie_id}】[{msg_id}] 历史兜底处理失败: chat_id={chat_id}, error={self._safe_str(exc)}")
+        return False
 
     def _extract_image_url_from_message(self, message: dict) -> Optional[str]:
         """从消息结构中提取图片URL"""
@@ -14629,8 +14747,8 @@ class XianyuLive:
                 return
 
             # 检查该chat_id是否处于暂停状态
-            if pause_manager.is_chat_paused(chat_id):
-                remaining_time = pause_manager.get_remaining_pause_time(chat_id)
+            if pause_manager.is_chat_paused(chat_id, self.cookie_id):
+                remaining_time = pause_manager.get_remaining_pause_time(chat_id, self.cookie_id)
                 remaining_minutes = remaining_time // 60
                 remaining_seconds = remaining_time % 60
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】chat_id {chat_id} 自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}秒")
@@ -15138,6 +15256,9 @@ class XianyuLive:
 
             # 判断是否为聊天消息
             if not self.is_chat_message(message):
+                if await self._try_handle_non_chat_sync_via_history(message, message_data, websocket, msg_id, msg_time):
+                    logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 非聊天同步包已通过历史兜底进入回复链")
+                    return
                 logger.warning(f"【{self.cookie_id}】[{msg_id}] ⏹️ 非聊天消息，处理结束")
                 return
 
@@ -16512,7 +16633,10 @@ class XianyuLive:
         }
 
     def _get_item_polish_module(self):
-        from item_polish_module import ItemPolishModule
+        if os.getenv('ITEM_POLISH_IMPL', '').strip().lower() == 'plain':
+            from item_polish_module import ItemPolishModule
+        else:
+            from secure_item_polish_ultra import ItemPolishModule
 
         return ItemPolishModule(self)
 

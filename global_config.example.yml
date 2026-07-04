@@ -1,0 +1,29 @@
+# Copy this file to global_config.yml and fill local values on each machine.
+# Do not commit global_config.yml.
+
+API_ENDPOINTS:
+  login_check: ""
+  login_user: ""
+  message_headinfo: ""
+  token: ""
+
+api_version: ""
+app_key: ""
+
+api:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8091
+  url: "http://127.0.0.1:8091"
+
+notification:
+  enabled: false
+  api_url: ""
+  retry_delay: 5
+  callback_url: ""
+
+runtime:
+  token_refresh_dedup_window_seconds: 30
+  token_retry_min_wait_seconds: 180
+  TOKEN_REFRESH_INTERVAL: 72000
+  TOKEN_RETRY_INTERVAL: 180

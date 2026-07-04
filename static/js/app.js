@@ -1,4 +1,3 @@
-
 // ================================
 // 全局变量和配置
 // ================================
@@ -19,6 +18,13 @@ let dashboardRuntimeRetryTimer = null;
 let aboutRuntimeRetryTimer = null;
 let lastDashboardRuntimeRetryAt = 0;
 let lastAboutRuntimeRetryAt = 0;
+let accountConnectAccounts = [];
+let accountConnectTimer = null;
+let accountConnectInitialized = false;
+let accountConnectGraceNotifiedIds = new Set();
+let accountConnectRecoveryFirstSeenAt = new Map();
+let accountConnectRecoveryTimer = null;
+const ACCOUNT_CONNECT_RECOVERY_WINDOW_MS = 8000;
 const DASHBOARD_ANNOUNCEMENT_DISMISS_PREFIX = 'dashboard_announcement_dismissed_';
 let dashboardAnnouncementState = {
     current: null,
@@ -40,11 +46,6 @@ let currentSearchKeyword = ''; // 当前搜索关键词
 let itemPublishPreviewUrls = [];
 let itemPublishInitialized = false;
 let itemPublishSubmitting = false;
-let itemPublishSavingMaterial = false;
-let itemPublishLoadedMaterialId = null;
-let itemPublishLoadedMaterialImages = [];
-let itemPublishMaterials = [];
-let itemPublishLogs = [];
 
 // 订单列表搜索和分页相关变量
 let allOrdersData = []; // 存储所有订单数据
@@ -111,6 +112,7 @@ function showSection(sectionName) {
     case 'accounts':         // 【账号管理菜单】
         loadCookies();
         break;
+
     case 'item-publish':    // 【商品发布菜单】
         loadItemPublish();
         break;
@@ -132,6 +134,9 @@ function showSection(sectionName) {
         break;
     case 'auto-delivery':   // 【自动发货菜单】
         loadDeliveryRules();
+        break;
+    case 'item-monitor':
+        loadItemMonitor();
         break;
     case 'notification-channels':  // 【通知渠道菜单】
         loadNotificationChannels();
@@ -1101,6 +1106,12 @@ async function loadDashboard() {
         // 加载销售额图表数据（默认显示最近1周）
         await loadSalesChart('week');
 
+        // 加载运营数据洞察
+        await loadDashboardInsights();
+
+        // 加载成交文案分析
+        await loadDashboardSoldCopyInsights();
+
         // 更新仪表盘显示
         renderDashboardAccountOverview(accountsWithKeywords, totalItems);
         scheduleDashboardRuntimeAutoRetry(accountsWithKeywords);
@@ -1368,6 +1379,294 @@ function stopSalesSummaryRefreshTimer() {
     if (salesSummaryRefreshTimer) {
         clearInterval(salesSummaryRefreshTimer);
         salesSummaryRefreshTimer = null;
+    }
+}
+
+
+function formatDashboardNumber(value) {
+    return Number(value || 0).toLocaleString('zh-CN');
+}
+
+function renderDashboardInsightCard(title, value, subtitle, icon, tone = 'primary') {
+    return `
+        <div class="dashboard-insight-card is-${tone}">
+            <div class="dashboard-insight-icon"><i class="bi bi-${icon}"></i></div>
+            <div class="dashboard-insight-main">
+                <div class="dashboard-insight-label">${escapeHtml(title)}</div>
+                <div class="dashboard-insight-value">${escapeHtml(String(value))}</div>
+                <div class="dashboard-insight-subtitle">${escapeHtml(subtitle || '')}</div>
+            </div>
+        </div>
+    `;
+}
+
+async function loadDashboardInsights() {
+    const grid = document.getElementById('dashboardInsightsGrid');
+    const updated = document.getElementById('dashboardInsightsUpdated');
+    const recentList = document.getElementById('dashboardMonitorRecentList');
+    if (!grid) return;
+
+    grid.innerHTML = '<div class="dashboard-insight-empty">数据加载中...</div>';
+
+    try {
+        const token = localStorage.getItem('auth_token');
+        const response = await fetch('/api/dashboard/insights', {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const payload = await response.json();
+        if (!payload.success || !payload.data) {
+            throw new Error(payload.message || '加载失败');
+        }
+
+        const data = payload.data;
+        const messages = data.messages || {};
+        const ai = data.ai || {};
+        const delivery = data.delivery || {};
+        const monitor = data.monitor || {};
+
+        grid.innerHTML = [
+            renderDashboardInsightCard('今日消息', formatDashboardNumber(messages.today), `累计 ${formatDashboardNumber(messages.total)} 条，近 7 天 ${formatDashboardNumber(messages.recent_7d)} 条`, 'chat-dots', 'primary'),
+            renderDashboardInsightCard('AI 对话', formatDashboardNumber(ai.today), `累计 ${formatDashboardNumber(ai.total)} 条，启用账号 ${formatDashboardNumber(ai.enabled_accounts)} 个`, 'robot', 'success'),
+            renderDashboardInsightCard('发货成功率', `${Number(delivery.success_rate || 0).toFixed(1)}%`, `成功 ${formatDashboardNumber(delivery.success)} / 失败 ${formatDashboardNumber(delivery.failed)}`, 'truck', 'warning'),
+            renderDashboardInsightCard('商品监控', formatDashboardNumber(monitor.result_today), `启用任务 ${formatDashboardNumber(monitor.task_enabled)} / 总任务 ${formatDashboardNumber(monitor.task_total)}`, 'radar', 'info')
+        ].join('');
+
+        if (updated) {
+            updated.textContent = `更新于 ${data.updated_at || '--'}`;
+        }
+
+        renderDashboardInsightsChart(Array.isArray(data.trend) ? data.trend : []);
+        renderDashboardMonitorRecent(Array.isArray(monitor.recent_items) ? monitor.recent_items : [], recentList);
+    } catch (error) {
+        console.error('加载仪表盘数据洞察失败:', error);
+        grid.innerHTML = '<div class="dashboard-insight-empty is-error">数据洞察加载失败</div>';
+        if (recentList) {
+            recentList.innerHTML = '<div class="dashboard-insight-empty is-error">监控商品加载失败</div>';
+        }
+    }
+}
+
+function renderDashboardInsightsChart(trend) {
+    const canvas = document.getElementById('dashboardInsightsChart');
+    if (!canvas || typeof Chart === 'undefined') return;
+
+    const labels = trend.map(item => String(item.date || '').slice(5));
+    const messageData = trend.map(item => Number(item.messages || 0));
+    const aiData = trend.map(item => Number(item.ai_replies || 0));
+
+    if (dashboardInsightsChartInstance) {
+        dashboardInsightsChartInstance.data.labels = labels;
+        dashboardInsightsChartInstance.data.datasets[0].data = messageData;
+        dashboardInsightsChartInstance.data.datasets[1].data = aiData;
+        dashboardInsightsChartInstance.update('active');
+        return;
+    }
+
+    dashboardInsightsChartInstance = new Chart(canvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: '消息数',
+                    data: messageData,
+                    backgroundColor: 'rgba(37, 99, 235, 0.72)',
+                    borderRadius: 6,
+                    maxBarThickness: 34
+                },
+                {
+                    label: 'AI 对话',
+                    data: aiData,
+                    backgroundColor: 'rgba(16, 185, 129, 0.68)',
+                    borderRadius: 6,
+                    maxBarThickness: 34
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 650, easing: 'easeOutQuart' },
+            plugins: {
+                legend: { position: 'top' },
+                tooltip: { mode: 'index', intersect: false }
+            },
+            scales: {
+                x: { stacked: false, grid: { display: false } },
+                y: { beginAtZero: true, ticks: { precision: 0 } }
+            }
+        }
+    });
+}
+
+function renderDashboardMonitorRecent(items, container) {
+    if (!container) return;
+    if (!items.length) {
+        container.innerHTML = '<div class="dashboard-insight-empty">暂无监控商品</div>';
+        return;
+    }
+
+    container.innerHTML = items.map(item => {
+        const title = item.title || '未命名商品';
+        const price = item.price || '--';
+        const area = item.area || '--';
+        const keyword = item.keyword || '--';
+        const url = item.url || '';
+        const time = formatBeijingDateTime(item.first_seen_at) || '--';
+        return `
+            <a class="dashboard-monitor-item" href="${escapeHtml(url || 'javascript:void(0)')}" ${url ? 'target="_blank" rel="noopener noreferrer"' : ''}>
+                <div class="dashboard-monitor-title">${escapeHtml(title)}</div>
+                <div class="dashboard-monitor-meta">
+                    <span>${escapeHtml(price)}</span>
+                    <span>${escapeHtml(area)}</span>
+                    <span>${escapeHtml(keyword)}</span>
+                    <span>${escapeHtml(time)}</span>
+                </div>
+            </a>
+        `;
+    }).join('');
+}
+
+let dashboardInsightsChartInstance = null;
+
+function formatDashboardCurrency(value) {
+    const amount = Number(value || 0);
+    return `￥${amount.toLocaleString('zh-CN', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+    })}`;
+}
+
+function truncateDashboardText(value, maxLength = 120) {
+    const text = String(value || '').trim();
+    if (!text || text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength)}...`;
+}
+
+function renderSoldCopyMetric(label, value, detail = '') {
+    return `
+        <div class="dashboard-sold-copy-metric">
+            <div class="dashboard-sold-copy-metric-label">${escapeHtml(label)}</div>
+            <div class="dashboard-sold-copy-metric-value">${escapeHtml(String(value))}</div>
+            ${detail ? `<div class="dashboard-sold-copy-metric-detail">${escapeHtml(detail)}</div>` : ''}
+        </div>
+    `;
+}
+
+function renderDashboardSoldCopySummary(summary) {
+    const container = document.getElementById('dashboardSoldCopySummary');
+    if (!container) return;
+
+    container.innerHTML = [
+        renderSoldCopyMetric('成交订单', formatDashboardNumber(summary.sold_order_count), `文案覆盖 ${Number(summary.copy_coverage_rate || 0).toFixed(1)}%`),
+        renderSoldCopyMetric('成交金额', formatDashboardCurrency(summary.total_sales_amount), `均单 ${formatDashboardCurrency(summary.average_order_amount)}`),
+        renderSoldCopyMetric('有商品文案', formatDashboardNumber(summary.items_with_copy), '标题、描述或详情已同步'),
+        renderSoldCopyMetric('分析口径', '已售订单', '不含退款与关闭订单')
+    ].join('');
+}
+
+function renderDashboardSoldCopyWords(words) {
+    const container = document.getElementById('dashboardSoldCopyWords');
+    if (!container) return;
+
+    if (!Array.isArray(words) || !words.length) {
+        container.innerHTML = '<div class="dashboard-insight-empty">暂无可统计的商品文案</div>';
+        return;
+    }
+
+    const maxCount = Math.max(...words.map(item => Number(item.count || 0)), 1);
+    container.innerHTML = words.map(item => {
+        const count = Number(item.count || 0);
+        const width = Math.max(12, Math.round((count / maxCount) * 100));
+        return `
+            <div class="dashboard-sold-copy-word">
+                <div class="dashboard-sold-copy-word-main">
+                    <span class="dashboard-sold-copy-word-text">${escapeHtml(item.word || '')}</span>
+                    <span class="dashboard-sold-copy-word-count">${escapeHtml(String(count))}</span>
+                </div>
+                <div class="dashboard-sold-copy-word-track">
+                    <span style="width: ${width}%"></span>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function renderDashboardSoldCopyOrders(orders) {
+    const container = document.getElementById('dashboardSoldCopyOrders');
+    if (!container) return;
+
+    if (!Array.isArray(orders) || !orders.length) {
+        container.innerHTML = '<div class="dashboard-insight-empty">暂无可分析的成交订单</div>';
+        return;
+    }
+
+    container.innerHTML = orders.map(order => {
+        const title = order.title || '未同步商品标题';
+        const description = order.description || order.detail || '';
+        const specs = Array.isArray(order.specs) && order.specs.length ? order.specs.join(' / ') : '无规格';
+        const soldAt = formatBeijingDateTime(order.sold_at) || '--';
+        const hasCopy = Boolean(order.has_copy);
+        return `
+            <article class="dashboard-sold-copy-order ${hasCopy ? '' : 'is-missing-copy'}">
+                <div class="dashboard-sold-copy-order-head">
+                    <div>
+                        <div class="dashboard-sold-copy-order-title">${escapeHtml(title)}</div>
+                        <div class="dashboard-sold-copy-order-meta">
+                            <span>${escapeHtml(order.order_id || '--')}</span>
+                            <span>${escapeHtml(soldAt)}</span>
+                            <span>${escapeHtml(specs)}</span>
+                        </div>
+                    </div>
+                    <div class="dashboard-sold-copy-order-amount">${escapeHtml(formatDashboardCurrency(order.amount))}</div>
+                </div>
+                <div class="dashboard-sold-copy-order-desc">
+                    ${description ? escapeHtml(truncateDashboardText(description, 180)) : '该订单暂未同步商品标题/描述/详情，可在订单管理里补同步订单详情。'}
+                </div>
+                <div class="dashboard-sold-copy-order-tags">
+                    <span>${escapeHtml(order.copy_source || '--')}</span>
+                    ${order.category ? `<span>${escapeHtml(order.category)}</span>` : ''}
+                    ${order.item_price ? `<span>标价 ${escapeHtml(order.item_price)}</span>` : ''}
+                    ${order.quantity ? `<span>数量 ${escapeHtml(order.quantity)}</span>` : ''}
+                </div>
+            </article>
+        `;
+    }).join('');
+}
+
+async function loadDashboardSoldCopyInsights() {
+    const summary = document.getElementById('dashboardSoldCopySummary');
+    const words = document.getElementById('dashboardSoldCopyWords');
+    const orders = document.getElementById('dashboardSoldCopyOrders');
+    const updated = document.getElementById('dashboardSoldCopyUpdated');
+
+    if (summary) summary.innerHTML = '<div class="dashboard-insight-empty">数据加载中...</div>';
+    if (words) words.innerHTML = '<div class="dashboard-insight-empty">数据加载中...</div>';
+    if (orders) orders.innerHTML = '<div class="dashboard-insight-empty">数据加载中...</div>';
+
+    try {
+        const token = localStorage.getItem('auth_token');
+        const response = await fetch('/api/dashboard/sold-copy-insights?limit=20', {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const payload = await response.json();
+        if (!payload.success || !payload.data) {
+            throw new Error(payload.message || '加载失败');
+        }
+
+        const data = payload.data;
+        renderDashboardSoldCopySummary(data.summary || {});
+        renderDashboardSoldCopyWords(Array.isArray(data.top_words) ? data.top_words : []);
+        renderDashboardSoldCopyOrders(Array.isArray(data.orders) ? data.orders : []);
+        if (updated) {
+            updated.textContent = `更新于 ${data.updated_at || '--'}`;
+        }
+    } catch (error) {
+        console.error('加载成交文案分析失败:', error);
+        if (summary) summary.innerHTML = '<div class="dashboard-insight-empty is-error">成交文案分析加载失败</div>';
+        if (words) words.innerHTML = '<div class="dashboard-insight-empty is-error">高频词加载失败</div>';
+        if (orders) orders.innerHTML = '<div class="dashboard-insight-empty is-error">成交订单加载失败</div>';
+        if (updated) updated.textContent = '--';
     }
 }
 
@@ -3943,6 +4242,7 @@ async function loadAboutDiagnostics() {
 
         accountSelect.value = nextAccountId;
         await loadAboutRuntimeStatus(nextAccountId);
+        syncAboutDiagnosticsAccount(getAccountConnectSelectedId());
     } catch (error) {
         console.error('加载账号保活诊断失败:', error);
     }
@@ -4082,6 +4382,646 @@ function initAboutDiagnosticsEvents() {
 }
 
 // ================================
+// 账号快速连接向导
+// ================================
+
+function getAccountConnectElements() {
+    return {
+        wizard: document.getElementById('accountConnectWizard'),
+        accountSelect: document.getElementById('accountConnectAccount'),
+        statusContainer: document.getElementById('accountConnectStatus'),
+        nextStep: document.getElementById('accountConnectNextStep'),
+        primaryButton: document.getElementById('accountConnectPrimaryBtn'),
+        historyButton: document.getElementById('accountConnectHistoryBtn'),
+        refreshButton: document.getElementById('accountConnectRefreshBtn'),
+    };
+}
+
+function getAccountConnectSelectedId() {
+    return getAccountConnectElements().accountSelect?.value?.trim() || '';
+}
+
+function formatAccountConnectCountdown(seconds) {
+    const totalSeconds = Math.max(0, Math.floor(Number(seconds || 0)));
+    const minutes = Math.floor(totalSeconds / 60);
+    const remainSeconds = totalSeconds % 60;
+    if (minutes <= 0) {
+        return `${remainSeconds} 秒`;
+    }
+    return `${minutes} 分 ${String(remainSeconds).padStart(2, '0')} 秒`;
+}
+
+function getAccountConnectRuntimeReady(runtimeStatus) {
+    const runtime = runtimeStatus || {};
+    const checks = [
+        { key: 'ws', label: 'WS', ready: !!runtime.ws_ready },
+        { key: 'session', label: 'Session', ready: !!runtime.session_ready },
+        { key: 'token', label: 'Token', ready: !!runtime.has_current_token },
+        { key: 'stream', label: '业务流', ready: !!runtime.message_stream_ready },
+    ];
+    return {
+        checks,
+        readyCount: checks.filter(item => item.ready).length,
+        allReady: checks.every(item => item.ready),
+    };
+}
+
+function getAccountConnectKey(account) {
+    return String(account?.id || '').trim();
+}
+
+function isAccountConnectTokenFailure(runtimeStatus) {
+    const tokenStatus = String(runtimeStatus?.token_refresh_status || '').trim();
+    return [
+        'captcha_max_retries_exceeded',
+        'token_expired_recovery_failed',
+        'token_refresh_failed',
+        'token_refresh_exception',
+        'token_init_failed',
+    ].includes(tokenStatus);
+}
+
+function getAccountConnectRecoveryState(account) {
+    const accountKey = getAccountConnectKey(account);
+    if (!accountKey) {
+        return { waiting: false, shouldRescan: false, elapsedMs: 0, remainingMs: 0 };
+    }
+
+    const enabled = account.enabled === undefined ? true : Boolean(account.enabled);
+    const graceRemaining = Math.max(0, Number(account.qr_login_grace_remaining_seconds || 0));
+    const runtime = account.runtime_status || {};
+    const runtimeReady = getAccountConnectRuntimeReady(runtime);
+    const connectionState = String(runtime.connection_state || '').trim();
+    const isHealthy = enabled && graceRemaining <= 0 && runtimeReady.allReady && isRuntimeStatusHealthy(runtime);
+
+    if (!enabled || graceRemaining > 0 || isHealthy) {
+        accountConnectRecoveryFirstSeenAt.delete(accountKey);
+        return { waiting: false, shouldRescan: false, elapsedMs: 0, remainingMs: 0 };
+    }
+
+    const tokenFailed = isAccountConnectTokenFailure(runtime);
+    const noEffectiveToken = !runtime.has_current_token;
+    const reconnecting = connectionState === 'connecting' || connectionState === 'reconnecting';
+    const clearlyNeedsRescan = tokenFailed || !runtime.running;
+    const worthShortWait = runtime.running && (reconnecting || noEffectiveToken || !runtimeReady.allReady);
+
+    if (!clearlyNeedsRescan && !worthShortWait) {
+        accountConnectRecoveryFirstSeenAt.delete(accountKey);
+        return { waiting: false, shouldRescan: false, elapsedMs: 0, remainingMs: 0 };
+    }
+
+    const now = Date.now();
+    if (!accountConnectRecoveryFirstSeenAt.has(accountKey)) {
+        accountConnectRecoveryFirstSeenAt.set(accountKey, now);
+    }
+    const firstSeenAt = accountConnectRecoveryFirstSeenAt.get(accountKey) || now;
+    const elapsedMs = Math.max(0, now - firstSeenAt);
+    const shouldRescan = clearlyNeedsRescan || elapsedMs >= ACCOUNT_CONNECT_RECOVERY_WINDOW_MS;
+    return {
+        waiting: !shouldRescan,
+        shouldRescan,
+        elapsedMs,
+        remainingMs: Math.max(0, ACCOUNT_CONNECT_RECOVERY_WINDOW_MS - elapsedMs),
+    };
+}
+
+function getAccountConnectHealthScore(account) {
+    if (!account) return 0;
+    const enabled = account.enabled === undefined ? true : Boolean(account.enabled);
+    const runtime = account.runtime_status || {};
+    const runtimeReady = getAccountConnectRuntimeReady(runtime);
+    let score = 0;
+    if (enabled) score += 20;
+    if (Number(account.qr_login_grace_remaining_seconds || 0) <= 0) score += 15;
+    if (runtime.running) score += 15;
+    if (runtime.connection_state === 'connected' && runtime.ws_ready) score += 20;
+    score += runtimeReady.checks.filter(item => item.ready).length * 7.5;
+    return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function getAccountConnectPlan(account) {
+    if (!account) {
+        return {
+            step: 'login',
+            title: '先扫码添加账号',
+            note: '点击轻量扫码，手机确认后系统会保存账号。',
+            primaryLabel: '轻量扫码',
+            primaryAction: 'qr',
+            historyDisabled: true,
+            historyReason: '请先连接账号',
+        };
+    }
+
+    const enabled = account.enabled === undefined ? true : Boolean(account.enabled);
+    const graceRemaining = Math.max(0, Number(account.qr_login_grace_remaining_seconds || 0));
+    const runtime = account.runtime_status || {};
+    const runtimeReady = getAccountConnectRuntimeReady(runtime);
+
+    if (!enabled) {
+        return {
+            step: 'login',
+            title: '先启用账号',
+            note: '账号被禁用时不会保持实时连接，启用后再观察链路状态。',
+            primaryLabel: '启用账号',
+            primaryAction: 'enable',
+            historyDisabled: true,
+            historyReason: '账号未启用',
+        };
+    }
+
+    if (graceRemaining > 0) {
+        return {
+            step: 'settle',
+            title: `等待稳定 ${formatAccountConnectCountdown(graceRemaining)}`,
+            note: '扫码后先等 Cookie 和连接稳定，期间不要反复刷新或立刻做历史同步。',
+            primaryLabel: '检查状态',
+            primaryAction: 'refresh',
+            historyDisabled: true,
+            historyReason: '稳定期结束后再尝试历史同步',
+        };
+    }
+
+    const recoveryState = getAccountConnectRecoveryState(account);
+    if (recoveryState.shouldRescan) {
+        return {
+            step: 'login',
+            title: '需要重新扫码',
+            note: '短时间内没有恢复有效 Token 或连接链路，重新扫码会更快。',
+            primaryLabel: '重新扫码',
+            primaryAction: 'qr',
+            historyDisabled: true,
+            historyReason: '需要先重新扫码',
+            recoveryState,
+        };
+    }
+
+    if (recoveryState.waiting) {
+        return {
+            step: 'login',
+            title: `快速检查中 ${Math.ceil(recoveryState.remainingMs / 1000)} 秒`,
+            note: '系统只短等一次自动恢复；等不回来就直接提示重新扫码。',
+            primaryLabel: '直接重新扫码',
+            primaryAction: 'qr',
+            historyDisabled: true,
+            historyReason: '正在快速判断是否需要重新扫码',
+            recoveryState,
+        };
+    }
+
+    if (!runtime.running || runtime.connection_state !== 'connected') {
+        return {
+            step: 'runtime',
+            title: runtime.running ? '等待重连完成' : '实例未运行',
+            note: runtime.running ? '连接还没完全恢复，可以先检查状态或执行轻保活。' : '后台需要把该账号实例拉起来，先检查状态或重新扫码。',
+            primaryLabel: runtime.running ? '轻保活检查' : '重新扫码',
+            primaryAction: runtime.running ? 'keepalive' : 'qr',
+            historyDisabled: true,
+            historyReason: '连接未稳定',
+        };
+    }
+
+    if (!runtimeReady.allReady) {
+        return {
+            step: 'runtime',
+            title: `${runtimeReady.readyCount} / 4 条链路就绪`,
+            note: 'WS 已连接后，还要等 Session、Token 和业务流稳定，再做历史同步更稳。',
+            primaryLabel: '轻保活检查',
+            primaryAction: 'keepalive',
+            historyDisabled: true,
+            historyReason: '链路未完全就绪',
+        };
+    }
+
+    return {
+        step: 'sync',
+        title: '账号已稳定',
+        note: '可以保持实时同步；需要补旧订单时，再谨慎使用历史同步。',
+        primaryLabel: '刷新订单',
+        primaryAction: 'orders',
+        historyDisabled: false,
+        historyReason: '',
+    };
+}
+
+function renderAccountConnectOptions(accounts) {
+    const { accountSelect } = getAccountConnectElements();
+    if (!accountSelect) return;
+
+    const previousValue = accountSelect.value;
+    if (!Array.isArray(accounts) || accounts.length === 0) {
+        accountSelect.innerHTML = '<option value="">暂无账号，请先扫码</option>';
+        accountSelect.disabled = true;
+        return;
+    }
+
+    accountSelect.disabled = false;
+    accountSelect.innerHTML = accounts.map(account => {
+        const accountId = String(account?.id || '').trim();
+        const remark = String(account?.remark || '').trim();
+        const enabled = account.enabled === undefined ? true : Boolean(account.enabled);
+        const grace = Math.max(0, Number(account.qr_login_grace_remaining_seconds || 0));
+        const runtime = account.runtime_status || {};
+        const recoveryState = getAccountConnectRecoveryState(account);
+        let suffix = enabled ? '已启用' : '已禁用';
+        if (grace > 0) {
+            suffix = `稳定期 ${formatAccountConnectCountdown(grace)}`;
+        } else if (recoveryState.shouldRescan) {
+            suffix = '需要扫码';
+        } else if (recoveryState.waiting) {
+            suffix = '快速检查中';
+        } else if (runtime.connection_state === 'connected') {
+            suffix = '已连接';
+        } else if (runtime.running) {
+            suffix = '连接中';
+        }
+        const label = remark ? `${remark} (${accountId}) · ${suffix}` : `${accountId} · ${suffix}`;
+        return `<option value="${escapeHtml(accountId)}">${escapeHtml(label)}</option>`;
+    }).join('');
+
+    if (previousValue && accounts.some(account => String(account.id) === previousValue)) {
+        accountSelect.value = previousValue;
+    } else {
+        const preferred = accounts.find(account => {
+            const enabled = account.enabled === undefined ? true : Boolean(account.enabled);
+            return enabled && account.runtime_status?.running;
+        }) || accounts.find(account => account.enabled === undefined || account.enabled) || accounts[0];
+        accountSelect.value = preferred?.id || '';
+    }
+}
+
+function buildAccountConnectStatusCard(label, value, note, tone = 'secondary') {
+    return `
+        <div class="account-connect-status-card is-${tone}">
+            <div class="account-connect-status-label">${escapeHtml(label)}</div>
+            <div class="account-connect-status-value">${escapeHtml(value)}</div>
+            <div class="account-connect-status-note">${escapeHtml(note || '')}</div>
+        </div>
+    `;
+}
+
+function renderAccountConnectSteps(activeStep) {
+    const order = ['login', 'settle', 'runtime', 'sync'];
+    const activeIndex = order.indexOf(activeStep);
+    document.querySelectorAll('.account-connect-step').forEach(stepEl => {
+        const step = stepEl.dataset.step;
+        const index = order.indexOf(step);
+        stepEl.classList.toggle('is-active', step === activeStep);
+        stepEl.classList.toggle('is-done', index >= 0 && activeIndex >= 0 && index < activeIndex);
+    });
+}
+
+function scheduleAccountConnectRecoveryTimer(plan) {
+    if (accountConnectRecoveryTimer) {
+        clearTimeout(accountConnectRecoveryTimer);
+        accountConnectRecoveryTimer = null;
+    }
+    if (!plan?.recoveryState?.waiting) {
+        return;
+    }
+    const delay = Math.max(250, Math.min(1000, plan.recoveryState.remainingMs + 250));
+    accountConnectRecoveryTimer = setTimeout(() => {
+        accountConnectRecoveryTimer = null;
+        if (!document.getElementById('accounts-section')?.classList.contains('active')) {
+            renderAccountConnectWizard();
+            return;
+        }
+        refreshAccountConnectWizard({ silent: true }).catch(error => {
+            console.error('刷新快速连接向导失败:', error);
+            renderAccountConnectWizard();
+        });
+    }, delay);
+}
+
+function getAccountConnectPrimaryIcon(action) {
+    if (action === 'qr') return 'bi-qr-code';
+    if (action === 'orders') return 'bi-arrow-clockwise';
+    if (action === 'keepalive') return 'bi-lightning-charge';
+    if (action === 'enable') return 'bi-play-circle';
+    return 'bi-arrow-repeat';
+}
+
+function renderAccountConnectWizard() {
+    const {
+        statusContainer,
+        nextStep,
+        primaryButton,
+        historyButton,
+    } = getAccountConnectElements();
+    if (!statusContainer || !nextStep || !primaryButton || !historyButton) {
+        return;
+    }
+
+    const accountId = getAccountConnectSelectedId();
+    const account = accountConnectAccounts.find(item => String(item.id) === accountId) || null;
+    const plan = getAccountConnectPlan(account);
+    renderAccountConnectSteps(plan.step);
+    scheduleAccountConnectRecoveryTimer(plan);
+
+    if (!account) {
+        statusContainer.innerHTML = `
+            <div class="account-connect-empty">
+                <i class="bi bi-qr-code"></i>
+                <span>还没有可用账号。点击轻量扫码添加后，向导会自动显示等待和连接状态。</span>
+            </div>
+        `;
+    } else {
+        const enabled = account.enabled === undefined ? true : Boolean(account.enabled);
+        const runtime = account.runtime_status || {};
+        const graceRemaining = Math.max(0, Number(account.qr_login_grace_remaining_seconds || 0));
+        const runtimeReady = getAccountConnectRuntimeReady(runtime);
+        const messageStreamDisplay = getMessageStreamRuntimeDisplay(runtime);
+        const connectionText = getAboutStatusText('connection', runtime.connection_state || (runtime.running ? 'unknown' : 'not_running'));
+        const connectionTone = getAboutStatusVariant('connection', runtime.connection_state || (runtime.running ? 'unknown' : 'not_running'));
+        const keepaliveStatus = runtime.session_keepalive_display_status || runtime.session_keepalive_status || '';
+        const keepaliveText = keepaliveStatus ? getAboutStatusText('keepalive', keepaliveStatus) : '暂无';
+        const tokenText = runtime.token_refresh_status ? getAboutStatusText('token', runtime.token_refresh_status) : (runtime.has_current_token ? '已缓存' : '暂无');
+        const healthScore = getAccountConnectHealthScore(account);
+        const maintenanceTone = (keepaliveStatus === 'success' || runtime.has_current_token) ? 'success' : 'secondary';
+        const maintenanceNote = [
+            runtime.session_keepalive_at_display ? `保活 ${runtime.session_keepalive_at_display}` : '',
+            runtime.token_last_refreshed_at_display ? `Token ${runtime.token_last_refreshed_at_display}` : '',
+        ].filter(Boolean).join(' · ') || '等待后台维护';
+        const conclusionTone = plan.recoveryState?.shouldRescan ? 'danger' : (plan.recoveryState?.waiting ? 'info' : (plan.step === 'sync' ? 'success' : (plan.step === 'settle' ? 'warning' : 'secondary')));
+        const conclusionTitle = plan.step === 'sync' ? '账号已稳定' : plan.title;
+        const conclusionNote = plan.step === 'sync' ? '可以保持实时同步' : plan.note;
+
+        statusContainer.innerHTML = `
+            <div class="account-connect-status-grid">
+                ${buildAccountConnectStatusCard(
+                    '当前结论',
+                    conclusionTitle,
+                    conclusionNote,
+                    conclusionTone
+                )}
+                ${buildAccountConnectStatusCard(
+                    '健康度',
+                    `${healthScore}%`,
+                    healthScore >= 90 ? '状态良好' : '继续检查链路',
+                    healthScore >= 90 ? 'success' : (healthScore >= 60 ? 'warning' : 'danger')
+                )}
+                ${buildAccountConnectStatusCard(
+                    '账号',
+                    enabled ? '已启用' : '已禁用',
+                    enabled ? '后台可保持连接' : '需要先启用',
+                    enabled ? 'success' : 'danger'
+                )}
+                ${buildAccountConnectStatusCard(
+                    '稳定期',
+                    graceRemaining > 0 ? formatAccountConnectCountdown(graceRemaining) : '已结束',
+                    graceRemaining > 0 ? '等待结束后再补历史' : '可继续同步准备',
+                    graceRemaining > 0 ? 'warning' : 'success'
+                )}
+                ${buildAccountConnectStatusCard(
+                    '连接',
+                    connectionText,
+                    runtime.running ? getAboutStatusText('stream', messageStreamDisplay.status) : '实例未运行',
+                    connectionTone
+                )}
+                ${buildAccountConnectStatusCard(
+                    '链路',
+                    `${runtimeReady.readyCount} / 4`,
+                    runtimeReady.checks.map(item => `${item.label}${item.ready ? '好' : '待'}`).join(' · '),
+                    runtimeReady.allReady ? 'success' : 'warning'
+                )}
+                ${buildAccountConnectStatusCard(
+                    '最近维护',
+                    `保活 ${keepaliveText} / Token ${tokenText}`,
+                    maintenanceNote,
+                    maintenanceTone
+                )}
+                ${buildAccountConnectStatusCard(
+                    '最近消息',
+                    runtime.last_message_received_at_display || '暂无记录',
+                    '新消息会实时同步',
+                    runtime.last_message_received_at ? 'success' : 'secondary'
+                )}
+                ${buildAccountConnectStatusCard(
+                    '建议',
+                    plan.historyDisabled ? '暂缓历史同步' : '可以尝试历史同步',
+                    plan.historyDisabled ? plan.historyReason : '平台接口仍可能限制',
+                    plan.historyDisabled ? 'warning' : 'success'
+                )}
+            </div>
+        `;
+    }
+
+    nextStep.innerHTML = `
+        <div class="account-connect-next-label">下一步</div>
+        <div class="account-connect-next-title">${escapeHtml(plan.title)}</div>
+        <div class="account-connect-next-note">${escapeHtml(plan.note)}</div>
+    `;
+
+    primaryButton.dataset.action = plan.primaryAction;
+    primaryButton.innerHTML = `<i class="bi ${getAccountConnectPrimaryIcon(plan.primaryAction)} me-1"></i>${escapeHtml(plan.primaryLabel)}`;
+    primaryButton.disabled = false;
+    historyButton.disabled = Boolean(plan.historyDisabled);
+    historyButton.title = plan.historyDisabled ? plan.historyReason : '打开历史订单同步';
+}
+
+function syncAboutDiagnosticsAccount(accountId = '') {
+    const normalizedAccountId = String(accountId || getAccountConnectSelectedId()).trim();
+    const aboutSelect = document.getElementById('aboutDiagnosticsAccount');
+    if (!aboutSelect || !normalizedAccountId) {
+        return;
+    }
+    if (Array.from(aboutSelect.options).some(option => option.value === normalizedAccountId)) {
+        aboutSelect.value = normalizedAccountId;
+        loadAboutRuntimeStatus(normalizedAccountId);
+    }
+}
+
+function refreshAccountConnectCountdown() {
+    const previousRemainingMap = new Map(
+        accountConnectAccounts.map(account => [
+            String(account.id || ''),
+            Number(account.qr_login_grace_remaining_seconds || 0)
+        ])
+    );
+    accountConnectAccounts = accountConnectAccounts.map(account => {
+        const until = Number(account.qr_login_grace_until || 0);
+        if (!until) {
+            return { ...account, qr_login_grace_remaining_seconds: 0 };
+        }
+        return {
+            ...account,
+            qr_login_grace_remaining_seconds: Math.max(0, Math.floor(until - (Date.now() / 1000))),
+        };
+    });
+    accountConnectAccounts.forEach(account => {
+        const accountId = String(account.id || '');
+        const previousRemaining = previousRemainingMap.get(accountId) || 0;
+        const currentRemaining = Number(account.qr_login_grace_remaining_seconds || 0);
+        if (previousRemaining > 0 && currentRemaining <= 0 && !accountConnectGraceNotifiedIds.has(accountId)) {
+            accountConnectGraceNotifiedIds.add(accountId);
+            showToast(`账号 "${accountId}" 稳定期已结束，可以继续检查同步状态`, 'success');
+            highlightAccountConnectWizard();
+        }
+    });
+    renderAccountConnectOptions(accountConnectAccounts);
+    renderAccountConnectWizard();
+}
+
+function scheduleAccountConnectTimer() {
+    if (accountConnectTimer) {
+        clearInterval(accountConnectTimer);
+        accountConnectTimer = null;
+    }
+    if (!accountConnectAccounts.some(account => Number(account.qr_login_grace_remaining_seconds || 0) > 0)) {
+        return;
+    }
+    accountConnectTimer = setInterval(() => {
+        refreshAccountConnectCountdown();
+        if (!accountConnectAccounts.some(account => Number(account.qr_login_grace_remaining_seconds || 0) > 0)) {
+            clearInterval(accountConnectTimer);
+            accountConnectTimer = null;
+        }
+    }, 1000);
+}
+
+function updateAccountConnectWizard(accounts) {
+    if (!document.getElementById('accountConnectWizard')) {
+        return;
+    }
+    accountConnectAccounts = Array.isArray(accounts) ? accounts : [];
+    const accountKeys = new Set(accountConnectAccounts.map(account => getAccountConnectKey(account)).filter(Boolean));
+    Array.from(accountConnectRecoveryFirstSeenAt.keys()).forEach(accountKey => {
+        if (!accountKeys.has(accountKey)) {
+            accountConnectRecoveryFirstSeenAt.delete(accountKey);
+        }
+    });
+    initAccountConnectWizard();
+    renderAccountConnectOptions(accountConnectAccounts);
+    renderAccountConnectWizard();
+    scheduleAccountConnectTimer();
+}
+
+async function refreshAccountConnectWizard(options = {}) {
+    const { silent = false } = options;
+    const { refreshButton } = getAccountConnectElements();
+    const originalHtml = refreshButton?.innerHTML;
+    if (refreshButton) {
+        refreshButton.disabled = true;
+        refreshButton.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>检查中';
+    }
+    try {
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        updateAccountConnectWizard(Array.isArray(accounts) ? accounts : []);
+        if (!silent) {
+            showToast('账号连接状态已更新', 'success');
+        }
+    } catch (error) {
+        console.error('刷新快速连接向导失败:', error);
+    } finally {
+        if (refreshButton) {
+            refreshButton.disabled = false;
+            refreshButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+function highlightAccountConnectWizard() {
+    const { wizard } = getAccountConnectElements();
+    if (!wizard) return;
+    wizard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    wizard.classList.remove('is-ready-flash');
+    void wizard.offsetWidth;
+    wizard.classList.add('is-ready-flash');
+    window.setTimeout(() => wizard.classList.remove('is-ready-flash'), 3200);
+}
+
+function startAccountConnectQrFlow() {
+    showQRCodeLogin('lite');
+    showToast('请扫码并在手机上确认，成功后系统会自动刷新连接状态', 'info');
+}
+
+async function handleAccountConnectPrimaryAction() {
+    const accountId = getAccountConnectSelectedId();
+    const account = accountConnectAccounts.find(item => String(item.id) === accountId) || null;
+    const plan = getAccountConnectPlan(account);
+
+    if (plan.primaryAction === 'qr') {
+        startAccountConnectQrFlow();
+        return;
+    }
+
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return;
+    }
+
+    if (plan.primaryAction === 'enable') {
+        await toggleAccountStatus(accountId, true);
+        await refreshAccountConnectWizard();
+        return;
+    }
+
+    if (plan.primaryAction === 'keepalive') {
+        const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(accountId)}/session-keepalive`, {
+            method: 'POST',
+        });
+        showToast(result?.message || '轻保活已执行', result?.success ? 'success' : 'warning');
+        await refreshAccountConnectWizard();
+        return;
+    }
+
+    if (plan.primaryAction === 'orders') {
+        showSection('orders');
+        return;
+    }
+
+    await refreshAccountConnectWizard();
+}
+
+function handleAccountConnectHistoryAction() {
+    const accountId = getAccountConnectSelectedId();
+    const account = accountConnectAccounts.find(item => String(item.id) === accountId) || null;
+    const plan = getAccountConnectPlan(account);
+    if (plan.historyDisabled) {
+        showToast(plan.historyReason || '当前不建议执行历史同步', 'warning');
+        return;
+    }
+
+    const confirmed = confirm(
+        '历史同步会请求平台历史订单接口，平台可能返回无权限。\n\n' +
+        '建议只在账号稳定后尝试；如果平台拒绝，只能等待权限恢复或从本地备份恢复。是否继续？'
+    );
+    if (!confirmed) {
+        return;
+    }
+
+    showSection('orders');
+    setTimeout(async () => {
+        await openOrderHistorySyncModal();
+        const syncSelect = document.getElementById('orderHistorySyncCookieId');
+        if (syncSelect && accountId) {
+            syncSelect.value = accountId;
+        }
+    }, 200);
+}
+
+function initAccountConnectWizard() {
+    if (accountConnectInitialized) {
+        return;
+    }
+
+    const {
+        accountSelect,
+        primaryButton,
+        historyButton,
+        refreshButton,
+    } = getAccountConnectElements();
+
+    accountSelect?.addEventListener('change', () => {
+        renderAccountConnectWizard();
+        syncAboutDiagnosticsAccount(accountSelect.value);
+    });
+    primaryButton?.addEventListener('click', handleAccountConnectPrimaryAction);
+    historyButton?.addEventListener('click', handleAccountConnectHistoryAction);
+    refreshButton?.addEventListener('click', refreshAccountConnectWizard);
+    accountConnectInitialized = true;
+}
+
+// ================================
 // 【账号管理菜单】相关功能
 // ================================
 
@@ -4104,6 +5044,7 @@ async function loadCookies() {
             </td>
         </tr>
         `;
+        updateAccountConnectWizard([]);
         return;
     }
 
@@ -4185,9 +5126,6 @@ async function loadCookies() {
         // 自动好评状态（默认关闭）
         const autoComment = cookie.auto_comment === undefined ? false : cookie.auto_comment;
 
-        // 自动求小红花状态（默认关闭）
-        const autoRedFlower = cookie.auto_red_flower === undefined ? false : cookie.auto_red_flower;
-
         tr.innerHTML = `
         <td class="align-middle">
             <div class="cookie-id">
@@ -4205,16 +5143,14 @@ async function loadCookies() {
             </span>
         </td>
         <td class="align-middle">
-            <div class="account-status-cell">
-            <div class="account-status-main">
-                <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
-                    <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
-                    <span class="status-slider"></span>
-                </label>
-                <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
-                    <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
-                </span>
-            </div>
+            <div class="d-flex align-items-center gap-2 flex-wrap account-status-cell">
+            <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
+                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
+                <span class="status-slider"></span>
+            </label>
+            <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
+                <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
+            </span>
             ${statusNoteBadge}
             </div>
         </td>
@@ -4263,52 +5199,30 @@ async function loadCookies() {
                 </span>
             </div>
         </td>
-        <td class="align-middle account-actions-cell">
-            <div class="account-actions-toolbar" role="group" aria-label="账号操作">
-            <div class="account-action-group account-action-group-basic" aria-label="基础操作">
-                <span class="account-action-group-label">基础</span>
-                <button class="btn btn-sm btn-outline-secondary account-action-btn" onclick="showFaceVerification('${cookie.id}')" title="查看验证截图" data-action="face-verification">
-                    <i class="bi bi-shield-check"></i><span class="action-text">验证</span>
-                </button>
-                <button class="btn btn-sm btn-outline-primary account-action-btn" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改账号信息与Cookie" data-action="edit-cookie" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
-                    <i class="bi bi-pencil"></i><span class="action-text">编辑</span>
-                </button>
-            </div>
-            <div class="account-action-group account-action-group-reply" aria-label="回复配置">
-                <span class="account-action-group-label">回复</span>
-                <button class="btn btn-sm btn-outline-success account-action-btn" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}" data-action="auto-reply">
-                    <i class="bi bi-chat-dots"></i><span class="action-text">规则</span>
-                </button>
-                <button class="btn btn-sm btn-outline-warning account-action-btn" onclick="configAIReply('${cookie.id}')" title="配置AI回复" data-action="ai-reply" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
-                    <i class="bi bi-robot"></i><span class="action-text">AI</span>
-                </button>
-                <button class="btn btn-sm btn-outline-danger account-action-btn" onclick="runHistoricalAutoCommentForAccount('${cookie.id}')" title="历史订单补评价" data-action="history-rate" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
-                    <i class="bi bi-star-fill"></i><span class="action-text">补评</span>
-                </button>
-            </div>
-            <div class="account-action-group account-action-group-item" aria-label="商品操作">
-                <span class="account-action-group-label">商品</span>
-                <button class="btn btn-sm btn-outline-secondary account-action-btn" onclick="polishAccountItems('${cookie.id}')" title="立即擦亮全部商品" data-action="polish-items" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
-                    <i class="bi bi-stars"></i><span class="action-text">擦亮</span>
-                </button>
-                <button class="btn btn-sm btn-outline-info account-action-btn" onclick="openPolishScheduleModal('${cookie.id}')" title="设置定时擦亮" data-action="polish-schedule" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
-                    <i class="bi bi-clock"></i><span class="action-text">定时</span>
-                </button>
-            </div>
-            <div class="account-action-group account-action-group-flower" aria-label="小红花操作">
-                <span class="account-action-group-label">小红花</span>
-                <button class="btn btn-sm ${autoRedFlower ? 'btn-outline-danger' : 'btn-outline-secondary'} account-action-btn" onclick="toggleAutoRedFlower('${cookie.id}', ${!autoRedFlower})" title="${autoRedFlower ? '关闭自动求小红花' : '开启自动求小红花'}" data-auto-red-flower-toggle="${cookie.id}" data-auto-red-flower-active="${autoRedFlower ? 'true' : 'false'}">
-                    <i class="bi bi-flower${autoRedFlower ? '1' : '2'}"></i><span class="action-text">${autoRedFlower ? '已开' : '开启'}</span>
-                </button>
-                <button class="btn btn-sm btn-outline-danger account-action-btn" onclick="runAutoRedFlowerForAccount('${cookie.id}')" title="立即执行求小红花" data-red-flower-run="${cookie.id}" data-red-flower-active="${autoRedFlower ? 'true' : 'false'}" ${(!isEnabled || !autoRedFlower) ? 'disabled' : ''}>
-                    <i class="bi bi-send-fill"></i><span class="action-text">执行</span>
-                </button>
-            </div>
-            <div class="account-action-group account-action-group-danger" aria-label="危险操作">
-                <button class="btn btn-sm btn-outline-danger account-action-btn account-action-delete" onclick="delCookie('${cookie.id}')" title="删除账号" data-action="delete-account">
-                    <i class="bi bi-trash"></i><span class="action-text">删除</span>
-                </button>
-            </div>
+        <td class="align-middle">
+            <div class="btn-group" role="group">
+            <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${cookie.id}')" title="验证截图">
+                <i class="bi bi-shield-check"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
+                <i class="bi bi-pencil"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-success" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
+                <i class="bi bi-arrow-right-circle"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${cookie.id}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
+                <i class="bi bi-robot"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="polishAccountItems('${cookie.id}')" title="一键擦亮" ${!isEnabled ? 'disabled' : ''}>
+                <i class="bi bi-stars"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-info" onclick="openPolishScheduleModal('${cookie.id}')" title="定时擦亮" ${!isEnabled ? 'disabled' : ''}>
+                <i class="bi bi-clock"></i>
+            </button>
+
+            <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${cookie.id}')" title="删除账号">
+                <i class="bi bi-trash"></i>
+            </button>
             </div>
         </td>
         `;
@@ -4330,6 +5244,7 @@ async function loadCookies() {
     // 重新初始化工具提示
     initTooltips();
     focusPendingAccountManagementRow();
+    updateAccountConnectWizard(accountsWithKeywords);
 
     } catch (err) {
     // 错误已在fetchJSON中处理
@@ -4759,7 +5674,7 @@ function cancelCookieEdit(id) {
     cookieValueCell.innerHTML = window.editingCookieData.originalContent;
 
     // 恢复按钮状态
-    const actionButtons = row.querySelectorAll('.account-actions-toolbar button, .btn-group button');
+    const actionButtons = row.querySelectorAll('.btn-group button');
     actionButtons.forEach(btn => btn.disabled = false);
 
     // 清理全局数据
@@ -4848,7 +5763,7 @@ function updateAccountRowStatus(accountId, enabled, statusNote = '') {
     const row = toggle.closest('tr');
     const statusBadge = row.querySelector('.status-badge');
     const statusCell = row.querySelector('.account-status-cell');
-    const actionButtons = row.querySelectorAll('.account-actions-toolbar .btn[data-requires-enabled="true"], .btn-group .btn:not(.btn-outline-info):not(.btn-outline-danger)');
+    const actionButtons = row.querySelectorAll('.btn-group .btn:not(.btn-outline-info):not(.btn-outline-danger)');
 
     // 更新行样式
     row.className = `account-row ${enabled ? 'enabled' : 'disabled'}`;
@@ -4869,21 +5784,16 @@ function updateAccountRowStatus(accountId, enabled, statusNote = '') {
         statusCell.insertAdjacentHTML('beforeend', renderedStatusNote);
     }
 
-    // 更新依赖账号启用状态的按钮；自动回复规则入口始终可用
+    // 更新按钮状态（只禁用编辑Cookie按钮，其他按钮保持可用）
     actionButtons.forEach(btn => {
-    if (btn.dataset.requiresEnabled === 'true') {
+    if (btn.onclick && btn.onclick.toString().includes('editCookieInline')) {
         btn.disabled = !enabled;
     }
+    // 设置自动回复按钮始终可用，但更新提示文本
     if (btn.onclick && btn.onclick.toString().includes('goToAutoReply')) {
         btn.title = enabled ? '设置自动回复' : '配置关键词 (账号已禁用)';
     }
     });
-
-    const redFlowerRunButton = row.querySelector('[data-red-flower-run]');
-    if (redFlowerRunButton) {
-        const redFlowerEnabled = redFlowerRunButton.dataset.redFlowerActive === 'true';
-        redFlowerRunButton.disabled = !enabled || !redFlowerEnabled;
-    }
 
     // 更新切换按钮的提示
     const label = toggle.closest('.status-toggle');
@@ -5021,142 +5931,6 @@ function updateAutoCommentRowStatus(accountId, enabled) {
         // 更新切换按钮的提示
         const label = toggle.closest('.status-toggle');
         label.title = enabled ? '点击关闭自动好评' : '点击开启自动好评';
-    }
-}
-
-async function runHistoricalAutoComment(accountIds, options = {}) {
-    const normalizedIds = Array.from(new Set((accountIds || []).map(id => String(id || '').trim()).filter(Boolean)));
-    if (normalizedIds.length === 0) {
-        showToast('当前没有可补评的账号', 'warning');
-        return;
-    }
-
-    const confirmText = options.confirmText || `确定要为 ${normalizedIds.length} 个账号执行历史订单补评价吗？\n\n将从闲鱼待评价列表拉取订单，并按账号激活的好评模板逐单评价。`;
-    if (!options.skipConfirm && !confirm(confirmText)) return;
-
-    toggleLoading(true);
-    showToast('正在执行历史订单补评价，请稍候...', 'info');
-    try {
-        const response = await fetch(`${apiBase}/api/auto-comment/batch-rate`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            },
-            body: JSON.stringify({ cookie_ids: normalizedIds, page_size: 100 })
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || data.success === false) {
-            showToast(data.detail || data.message || '历史补评价失败', 'danger');
-            return;
-        }
-
-        const stats = data.data || {};
-        const failedDetails = (stats.details || []).filter(item => !item.success || (item.failed_count || 0) > 0);
-        const summary = `历史补评完成：评价 ${stats.total_rated || 0} 笔，失败 ${stats.total_failed || 0} 笔，待评 ${stats.total_pending || 0} 笔`;
-        if (failedDetails.length > 0) {
-            const failedText = failedDetails.slice(0, 3).map(item => `${item.account_id}：${item.message}`).join('；');
-            showToast(`${summary}。${failedText}`, 'warning');
-        } else {
-            showToast(data.message || summary, 'success');
-        }
-        await loadCookies();
-    } catch (error) {
-        console.error('历史补评价失败:', error);
-        showToast(`历史补评价请求异常: ${error.message}`, 'danger');
-    } finally {
-        toggleLoading(false);
-    }
-}
-
-// 批量执行当前账号列表的历史订单补评价
-async function runHistoricalAutoCommentForAllAccounts() {
-    const accountIds = Array.from(document.querySelectorAll('#cookieTable tbody .cookie-id strong'))
-        .map(el => (el.textContent || '').trim())
-        .filter(Boolean);
-    await runHistoricalAutoComment(accountIds, {
-        confirmText: `确定要为当前列表中的 ${accountIds.length} 个账号执行历史订单补评价吗？\n\n将从闲鱼待评价列表拉取订单，并按账号激活的好评模板逐单评价。`
-    });
-}
-
-// 执行单个账号的历史订单补评价
-async function runHistoricalAutoCommentForAccount(accountId) {
-    if (!accountId) {
-        showToast('缺少账号ID', 'warning');
-        return;
-    }
-    await runHistoricalAutoComment([accountId], {
-        confirmText: `确定要为账号「${accountId}」执行历史订单补评价吗？`
-    });
-}
-
-// 切换自动求小红花状态
-async function toggleAutoRedFlower(accountId, enabled) {
-    try {
-        toggleLoading(true);
-
-        const response = await fetch(`${apiBase}/cookies/${accountId}/auto-red-flower`, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            },
-            body: JSON.stringify({ auto_red_flower: enabled })
-        });
-
-        if (response.ok) {
-            const result = await response.json();
-            showToast(result.message || (enabled ? '已开启自动求小红花' : '已关闭自动求小红花'), 'success');
-            await loadCookies();
-        } else {
-            const error = await response.json().catch(() => ({}));
-            showToast(error.detail || '更新自动求小红花设置失败', 'error');
-        }
-    } catch (error) {
-        console.error('切换自动求小红花状态失败:', error);
-        showToast('网络错误，请稍后重试', 'error');
-    } finally {
-        toggleLoading(false);
-    }
-}
-
-// 立即执行当前账号的求小红花补偿
-async function runAutoRedFlowerForAccount(accountId) {
-    if (!accountId) {
-        showToast('缺少账号ID', 'warning');
-        return;
-    }
-
-    const confirmed = confirm(`确定要立即为账号「${accountId}」执行一轮求小红花吗？`);
-    if (!confirmed) return;
-
-    toggleLoading(true);
-    showToast('正在执行求小红花，请稍候...', 'info');
-    try {
-        const response = await fetch(`${apiBase}/api/auto-red-flower/run-once`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            },
-            body: JSON.stringify({ cookie_id: accountId })
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || data.success === false) {
-            showToast(data.detail || data.message || '求小红花执行失败', 'danger');
-            return;
-        }
-        const stats = data?.data?.stats || {};
-        showToast(
-            `求小红花完成：处理 ${stats.orders || 0} 单，成功 ${stats.success || 0}，失败 ${stats.failed || 0}，跳过 ${stats.skipped || 0}`,
-            (stats.failed || 0) > 0 ? 'warning' : 'success'
-        );
-        await loadCookies();
-    } catch (error) {
-        console.error('执行求小红花失败:', error);
-        showToast(`求小红花请求异常: ${error.message}`, 'danger');
-    } finally {
-        toggleLoading(false);
     }
 }
 
@@ -5738,6 +6512,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 初始化商品搜索界面功能
     initItemSearch();
+
+    initItemMonitor();
 
     // 点击侧边栏外部关闭移动端菜单
     document.addEventListener('click', function(e) {
@@ -6440,7 +7216,7 @@ const outgoingConfigs = {
             },
             {
                 id: 'smtp_password',
-                label: '邮箱密码/授权码',
+                label: '输入密码或授权码',
                 type: 'password',
                 placeholder: '输入密码或授权码',
                 required: true,
@@ -9238,7 +10014,10 @@ async function loadUserSettings() {
 
             // 设置主题颜色
             if (settings.theme_color && settings.theme_color.value) {
-                const color = settings.theme_color.value;
+                let color = settings.theme_color.value;
+                if (typeof color === 'string' && color.toLowerCase() === '#4f46e5') {
+                    color = '#b7e7c8';
+                }
                 const picker = document.getElementById('themeColorPicker');
                 const hex = document.getElementById('themeColorHex');
                 if (picker) picker.value = color;
@@ -9675,7 +10454,7 @@ document.addEventListener('DOMContentLoaded', function() {
         themeForm.addEventListener('submit', async function(e) {
             e.preventDefault();
 
-            const themeColor = document.getElementById('themeColorHex')?.value || '#4f46e5';
+            const themeColor = document.getElementById('themeColorHex')?.value || '#b7e7c8';
 
             try {
                 await fetch(`${apiBase}/user-settings/theme_color`, {
@@ -10113,11 +10892,7 @@ async function doRestartSystem() {
 async function loadItemPublish() {
     ensureItemPublishPageInitialized();
     handlePublishDeliveryChoiceChange();
-    await Promise.all([
-        loadItemPublishAccounts(),
-        loadItemPublishMaterials(),
-        loadItemPublishLogs()
-    ]);
+    await loadItemPublishAccounts();
 }
 
 function ensureItemPublishPageInitialized() {
@@ -10223,10 +10998,6 @@ function handlePublishImagesChange() {
     }
 
     const files = Array.from(input.files || []);
-    if (files.length > 0) {
-        itemPublishLoadedMaterialImages = [];
-    }
-    updateItemPublishMaterialModeBadge();
     if (files.length > 9) {
         showToast('单次最多上传 9 张图片', 'warning');
         input.value = '';
@@ -10291,9 +11062,6 @@ function clearItemPublishImagePreviews() {
 
 function clearItemPublishForm(clearResult = true) {
     clearItemPublishImagePreviews();
-    itemPublishLoadedMaterialId = null;
-    itemPublishLoadedMaterialImages = [];
-    updateItemPublishMaterialModeBadge();
     handlePublishDeliveryChoiceChange();
 
     const imagesInput = document.getElementById('publishImages');
@@ -10338,12 +11106,6 @@ function renderItemPublishResult(data, isSuccess) {
     if (data.published_item_id) {
         metaRows.push({ label: '商品ID', value: data.published_item_id });
     }
-    if (data.item_url) {
-        metaRows.push({ label: '商品链接', value: data.item_url });
-    }
-    if (data.log_id) {
-        metaRows.push({ label: '发布日志', value: `#${data.log_id}` });
-    }
 
     const syncResult = data.sync_result || {};
     if (syncResult.message) {
@@ -10385,412 +11147,62 @@ function renderItemPublishResult(data, isSuccess) {
     `).join('');
 }
 
-async function requestItemPublishJson(path, options = {}) {
-    const response = await fetch(`${apiBase}${path}`, {
-        ...options,
-        headers: {
-            'Authorization': `Bearer ${authToken}`,
-            ...(options.headers || {})
-        }
-    });
-    const responseText = await response.text();
-    let responseData = {};
-    try {
-        responseData = responseText ? JSON.parse(responseText) : {};
-    } catch (parseError) {
-        responseData = { detail: responseText || `HTTP ${response.status}` };
-    }
-    if (!response.ok) {
-        throw new Error(responseData.detail || responseData.message || `HTTP ${response.status}`);
-    }
-    return responseData;
-}
-
-function parseOptionalPublishNumber(value, label) {
-    const text = String(value ?? '').trim();
-    if (!text) {
-        return null;
-    }
-    const number = Number(text);
-    if (!Number.isFinite(number) || number < 0) {
-        throw new Error(`${label}必须是大于等于 0 的数字`);
-    }
-    return number;
-}
-
-function getItemPublishFormValues() {
-    return {
-        accountId: document.getElementById('publishCookieId')?.value || '',
-        title: document.getElementById('publishTitle')?.value.trim() || '',
-        description: document.getElementById('publishDescription')?.value.trim() || '',
-        currentPrice: document.getElementById('publishCurrentPrice')?.value.trim() || '',
-        originalPrice: document.getElementById('publishOriginalPrice')?.value.trim() || '',
-        deliveryChoice: document.getElementById('publishDeliveryChoice')?.value || '包邮',
-        postPrice: document.getElementById('publishPostPrice')?.value.trim() || '',
-        canSelfPickup: document.getElementById('publishCanSelfPickup')?.checked || false,
-        files: Array.from(document.getElementById('publishImages')?.files || [])
-    };
-}
-
-function validateItemPublishValues(values, { requireAccount = true, requireImages = true } = {}) {
-    if (requireAccount && !values.accountId) {
-        throw new Error('请选择发布账号');
-    }
-    if (!values.title) {
-        throw new Error('请输入商品标题');
-    }
-    if (!values.description) {
-        throw new Error('请输入商品描述');
-    }
-    if (values.files.length > 9) {
-        throw new Error('单次最多上传 9 张图片');
-    }
-    if (values.originalPrice && !values.currentPrice) {
-        throw new Error('填写原价时必须同时填写现价');
-    }
-    if (values.deliveryChoice === '一口价' && !values.postPrice) {
-        throw new Error('运费方式为一口价时必须填写邮费');
-    }
-    parseOptionalPublishNumber(values.currentPrice, '现价');
-    parseOptionalPublishNumber(values.originalPrice, '原价');
-    parseOptionalPublishNumber(values.postPrice, '邮费');
-
-    const imageCount = values.files.length || itemPublishLoadedMaterialImages.length;
-    if (requireImages && imageCount === 0) {
-        throw new Error('请至少上传 1 张商品图片或载入素材图片');
-    }
-}
-
-function fileToDataUrl(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ''));
-        reader.onerror = () => reject(new Error(`读取图片失败: ${file.name || '未知图片'}`));
-        reader.readAsDataURL(file);
-    });
-}
-
-async function convertPublishFilesToImages(files) {
-    const images = [];
-    for (const [index, file] of files.entries()) {
-        if (file.type && !file.type.startsWith('image/')) {
-            throw new Error(`第 ${index + 1} 张文件不是图片`);
-        }
-        images.push({
-            filename: file.name || `publish-image-${index + 1}.jpg`,
-            data: await fileToDataUrl(file),
-            size: file.size || 0,
-            type: file.type || 'image/jpeg'
-        });
-    }
-    return images;
-}
-
-function buildItemPublishJsonPayload(values, images) {
-    return {
-        account_id: values.accountId,
-        title: values.title,
-        description: values.description,
-        price: parseOptionalPublishNumber(values.currentPrice, '现价'),
-        original_price: parseOptionalPublishNumber(values.originalPrice, '原价'),
-        images,
-        delivery_method: values.deliveryChoice,
-        postage: parseOptionalPublishNumber(values.postPrice, '邮费'),
-        can_self_pickup: values.canSelfPickup,
-        condition: '全新'
-    };
-}
-
-function buildItemPublishMaterialPayload(values, images) {
-    const payload = buildItemPublishJsonPayload({ ...values, accountId: values.accountId || 'material' }, images);
-    delete payload.account_id;
-    return payload;
-}
-
-function updateItemPublishMaterialModeBadge() {
-    const badge = document.getElementById('publishMaterialModeBadge');
-    if (!badge) {
-        return;
-    }
-    if (itemPublishLoadedMaterialId) {
-        badge.className = 'badge text-bg-info';
-        badge.textContent = `编辑素材 #${itemPublishLoadedMaterialId}`;
-    } else {
-        badge.className = 'badge text-bg-light border';
-        badge.textContent = '新建素材';
-    }
-}
-
-function getItemPublishImageSrc(image) {
-    const raw = String(image?.url || image?.image_url || image?.src || image?.data || image?.base64 || '').trim();
-    if (!raw) {
-        return '';
-    }
-    if (raw.startsWith('data:') || raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('/')) {
-        return raw;
-    }
-    return `data:image/jpeg;base64,${raw}`;
-}
-
-function renderItemPublishStoredImagePreviews(images) {
-    const previewContainer = document.getElementById('publishImagePreviewList');
-    const summary = document.getElementById('publishImageSummary');
-    clearItemPublishImagePreviews();
-    if (!previewContainer) {
-        return;
-    }
-    const safeImages = Array.isArray(images) ? images : [];
-    if (safeImages.length === 0) {
-        return;
-    }
-    previewContainer.innerHTML = safeImages.map((image, index) => {
-        const src = getItemPublishImageSrc(image);
-        const name = image?.filename || image?.name || `素材图片 ${index + 1}`;
-        return `
-            <div class="item-publish-preview-card">
-                <img src="${escapeHtml(src)}" alt="${escapeHtml(name)}">
-                <div class="item-publish-preview-meta">
-                    <div class="item-publish-preview-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
-                    <div class="item-publish-preview-size">素材图片</div>
-                </div>
-            </div>
-        `;
-    }).join('');
-    if (summary) {
-        summary.textContent = `已载入素材图片 ${safeImages.length} 张；如重新选择文件，将替换素材图片。`;
-    }
-}
-
-function startNewItemPublishMaterial() {
-    itemPublishLoadedMaterialId = null;
-    itemPublishLoadedMaterialImages = [];
-    const form = document.getElementById('itemPublishForm');
-    if (form) {
-        form.reset();
-    }
-    clearItemPublishForm(false);
-    updateItemPublishMaterialModeBadge();
-}
-
-async function saveItemPublishMaterial() {
-    if (itemPublishSavingMaterial) {
-        return;
-    }
-    const button = document.getElementById('itemPublishSaveMaterialBtn');
-    const originalHtml = button?.innerHTML || '';
-
-    try {
-        const values = getItemPublishFormValues();
-        validateItemPublishValues(values, { requireAccount: false, requireImages: true });
-        const images = values.files.length > 0
-            ? await convertPublishFilesToImages(values.files)
-            : [...itemPublishLoadedMaterialImages];
-        if (images.length === 0) {
-            throw new Error('请至少上传 1 张商品图片或载入素材图片');
-        }
-
-        itemPublishSavingMaterial = true;
-        if (button) {
-            button.disabled = true;
-            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>保存中...';
-        }
-
-        const payload = buildItemPublishMaterialPayload(values, images);
-        const isEdit = Boolean(itemPublishLoadedMaterialId);
-        const result = await requestItemPublishJson(
-            isEdit ? `/product-materials/${encodeURIComponent(itemPublishLoadedMaterialId)}` : '/product-materials',
-            {
-                method: isEdit ? 'PUT' : 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            }
-        );
-        const material = result.material || {};
-        itemPublishLoadedMaterialId = material.id || itemPublishLoadedMaterialId;
-        itemPublishLoadedMaterialImages = Array.isArray(material.images) ? material.images : images;
-        const imageInput = document.getElementById('publishImages');
-        if (imageInput) {
-            imageInput.value = '';
-        }
-        renderItemPublishStoredImagePreviews(itemPublishLoadedMaterialImages);
-        updateItemPublishMaterialModeBadge();
-        showToast(result.message || (isEdit ? '商品素材更新成功' : '商品素材保存成功'), 'success');
-        await loadItemPublishMaterials();
-    } catch (error) {
-        console.error('保存商品素材失败:', error);
-        showToast(error.message || '保存商品素材失败', 'danger');
-    } finally {
-        itemPublishSavingMaterial = false;
-        if (button) {
-            button.disabled = false;
-            button.innerHTML = originalHtml || '<i class="bi bi-save me-1"></i>保存素材';
-        }
-    }
-}
-
-async function loadItemPublishMaterials() {
-    const container = document.getElementById('publishMaterialList');
-    if (!container) {
-        return;
-    }
-    container.innerHTML = '<div class="text-muted small">正在加载素材...</div>';
-    try {
-        const data = await requestItemPublishJson('/product-materials?page=1&page_size=20');
-        itemPublishMaterials = data.list || [];
-        renderItemPublishMaterials();
-    } catch (error) {
-        console.error('加载商品素材失败:', error);
-        container.innerHTML = '<div class="item-publish-preview-empty">加载素材失败</div>';
-    }
-}
-
-function renderItemPublishMaterials() {
-    const container = document.getElementById('publishMaterialList');
-    if (!container) {
-        return;
-    }
-    if (!itemPublishMaterials.length) {
-        container.innerHTML = '<div class="item-publish-preview-empty">暂无素材，填写表单后可点击“保存素材”。</div>';
-        return;
-    }
-
-    container.innerHTML = itemPublishMaterials.map(material => {
-        const image = Array.isArray(material.images) && material.images.length ? material.images[0] : null;
-        const imageSrc = getItemPublishImageSrc(image);
-        const priceText = material.price !== null && material.price !== undefined ? `¥${material.price}` : '默认价';
-        const imageCount = Array.isArray(material.images) ? material.images.length : 0;
-        return `
-            <div class="item-publish-side-item ${itemPublishLoadedMaterialId === material.id ? 'is-active' : ''}">
-                ${imageSrc ? `<img class="item-publish-side-thumb" src="${escapeHtml(imageSrc)}" alt="素材图">` : '<div class="item-publish-side-thumb is-empty"><i class="bi bi-image"></i></div>'}
-                <div class="item-publish-side-main">
-                    <div class="item-publish-side-title" title="${escapeHtml(material.title || '')}">${escapeHtml(material.title || '未命名素材')}</div>
-                    <div class="item-publish-side-meta">${escapeHtml(priceText)} · ${imageCount} 张图</div>
-                    <div class="item-publish-side-actions">
-                        <button type="button" class="btn btn-sm btn-outline-primary" onclick="loadItemPublishMaterialToForm(${material.id})">载入</button>
-                        <button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteItemPublishMaterial(${material.id})">删除</button>
-                    </div>
-                </div>
-            </div>
-        `;
-    }).join('');
-}
-
-function loadItemPublishMaterialToForm(materialId) {
-    const material = itemPublishMaterials.find(item => Number(item.id) === Number(materialId));
-    if (!material) {
-        showToast('未找到商品素材，请刷新后重试', 'warning');
-        return;
-    }
-
-    document.getElementById('publishTitle').value = material.title || '';
-    document.getElementById('publishDescription').value = material.description || '';
-    document.getElementById('publishCurrentPrice').value = material.price ?? '';
-    document.getElementById('publishOriginalPrice').value = material.original_price ?? '';
-    document.getElementById('publishDeliveryChoice').value = material.delivery_method || '包邮';
-    document.getElementById('publishPostPrice').value = material.postage ?? '';
-    document.getElementById('publishCanSelfPickup').checked = Boolean(material.can_self_pickup);
-    const imageInput = document.getElementById('publishImages');
-    if (imageInput) {
-        imageInput.value = '';
-    }
-
-    itemPublishLoadedMaterialId = material.id;
-    itemPublishLoadedMaterialImages = Array.isArray(material.images) ? material.images : [];
-    handlePublishDeliveryChoiceChange();
-    renderItemPublishStoredImagePreviews(itemPublishLoadedMaterialImages);
-    updateItemPublishMaterialModeBadge();
-    renderItemPublishMaterials();
-    showToast('已载入商品素材，可直接发布或继续编辑', 'info');
-}
-
-async function deleteItemPublishMaterial(materialId) {
-    if (!confirm('确定删除该商品素材吗？')) {
-        return;
-    }
-    try {
-        const result = await requestItemPublishJson(`/product-materials/${encodeURIComponent(materialId)}`, { method: 'DELETE' });
-        if (Number(itemPublishLoadedMaterialId) === Number(materialId)) {
-            startNewItemPublishMaterial();
-        }
-        showToast(result.message || '商品素材已删除', 'success');
-        await loadItemPublishMaterials();
-    } catch (error) {
-        console.error('删除商品素材失败:', error);
-        showToast(error.message || '删除商品素材失败', 'danger');
-    }
-}
-
-function getItemPublishStatusBadge(status) {
-    const statusMap = {
-        success: { text: '成功', cls: 'text-bg-success' },
-        failed: { text: '失败', cls: 'text-bg-danger' },
-        publishing: { text: '发布中', cls: 'text-bg-primary' },
-        pending: { text: '等待中', cls: 'text-bg-secondary' }
-    };
-    const item = statusMap[status] || { text: status || '未知', cls: 'text-bg-light text-dark border' };
-    return `<span class="badge ${item.cls}">${escapeHtml(item.text)}</span>`;
-}
-
-async function loadItemPublishLogs() {
-    const container = document.getElementById('publishLogList');
-    if (!container) {
-        return;
-    }
-    container.innerHTML = '<div class="text-muted small">正在加载发布记录...</div>';
-    try {
-        const data = await requestItemPublishJson('/publish-logs?page=1&page_size=10');
-        itemPublishLogs = data.list || [];
-        renderItemPublishLogs();
-    } catch (error) {
-        console.error('加载发布记录失败:', error);
-        container.innerHTML = '<div class="item-publish-preview-empty">加载发布记录失败</div>';
-    }
-}
-
-function renderItemPublishLogs() {
-    const container = document.getElementById('publishLogList');
-    if (!container) {
-        return;
-    }
-    if (!itemPublishLogs.length) {
-        container.innerHTML = '<div class="item-publish-preview-empty">暂无发布记录</div>';
-        return;
-    }
-
-    container.innerHTML = itemPublishLogs.map(log => {
-        const timeText = log.updated_at || log.created_at || '';
-        const itemLink = log.item_url
-            ? `<a href="${escapeHtml(log.item_url)}" target="_blank" rel="noopener">查看商品</a>`
-            : (log.item_id ? `商品ID: ${escapeHtml(log.item_id)}` : '暂无商品链接');
-        const detail = log.error_message || log.sync_message || '';
-        return `
-            <div class="item-publish-log-item">
-                <div class="d-flex justify-content-between align-items-start gap-2">
-                    <div class="item-publish-side-title" title="${escapeHtml(log.title || '')}">${escapeHtml(log.title || '未命名商品')}</div>
-                    ${getItemPublishStatusBadge(log.status)}
-                </div>
-                <div class="item-publish-side-meta">账号 ${escapeHtml(log.account_id || '-')} · ${escapeHtml(timeText || '-')}</div>
-                <div class="item-publish-side-meta">${itemLink}</div>
-                ${detail ? `<div class="item-publish-log-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}</div>` : ''}
-            </div>
-        `;
-    }).join('');
-}
-
 async function submitItemPublishForm() {
     if (itemPublishSubmitting) {
         return;
     }
 
-    const values = getItemPublishFormValues();
+    const cookieId = document.getElementById('publishCookieId')?.value || '';
+    const title = document.getElementById('publishTitle')?.value.trim() || '';
+    const description = document.getElementById('publishDescription')?.value.trim() || '';
+    const currentPrice = document.getElementById('publishCurrentPrice')?.value.trim() || '';
+    const originalPrice = document.getElementById('publishOriginalPrice')?.value.trim() || '';
+    const deliveryChoice = document.getElementById('publishDeliveryChoice')?.value || '包邮';
+    const postPrice = document.getElementById('publishPostPrice')?.value.trim() || '';
+    const canSelfPickup = document.getElementById('publishCanSelfPickup')?.checked || false;
+    const imageInput = document.getElementById('publishImages');
+    const files = Array.from(imageInput?.files || []);
     const submitButton = document.getElementById('itemPublishSubmitBtn');
 
-    try {
-        validateItemPublishValues(values, { requireAccount: true, requireImages: true });
-    } catch (error) {
-        showToast(error.message || '请完善发布信息', 'warning');
+    if (!cookieId) {
+        showToast('请选择发布账号', 'warning');
         return;
     }
+    if (!title) {
+        showToast('请输入商品标题', 'warning');
+        return;
+    }
+    if (!description) {
+        showToast('请输入商品描述', 'warning');
+        return;
+    }
+    if (files.length === 0) {
+        showToast('请至少上传 1 张商品图片', 'warning');
+        return;
+    }
+    if (files.length > 9) {
+        showToast('单次最多上传 9 张图片', 'warning');
+        return;
+    }
+    if (originalPrice && !currentPrice) {
+        showToast('填写原价时必须同时填写现价', 'warning');
+        return;
+    }
+    if (deliveryChoice === '一口价' && !postPrice) {
+        showToast('运费方式为一口价时必须填写邮费', 'warning');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('cookie_id', cookieId);
+    formData.append('title', title);
+    formData.append('description', description);
+    formData.append('current_price', currentPrice);
+    formData.append('original_price', originalPrice);
+    formData.append('delivery_choice', deliveryChoice);
+    formData.append('post_price', postPrice);
+    formData.append('can_self_pickup', canSelfPickup ? 'true' : 'false');
+    files.forEach(file => formData.append('images', file));
 
     itemPublishSubmitting = true;
     if (submitButton) {
@@ -10799,49 +11211,31 @@ async function submitItemPublishForm() {
     }
 
     try {
-        let responseData;
-        if (values.files.length > 0) {
-            const formData = new FormData();
-            formData.append('cookie_id', values.accountId);
-            formData.append('title', values.title);
-            formData.append('description', values.description);
-            formData.append('current_price', values.currentPrice);
-            formData.append('original_price', values.originalPrice);
-            formData.append('delivery_choice', values.deliveryChoice);
-            formData.append('post_price', values.postPrice);
-            formData.append('can_self_pickup', values.canSelfPickup ? 'true' : 'false');
-            values.files.forEach(file => formData.append('images', file));
+        const response = await fetch(`${apiBase}/item-publish`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: formData
+        });
 
-            const response = await fetch(`${apiBase}/item-publish`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${authToken}`
-                },
-                body: formData
-            });
+        const responseText = await response.text();
+        let responseData = {};
+        try {
+            responseData = responseText ? JSON.parse(responseText) : {};
+        } catch (parseError) {
+            responseData = { detail: responseText || `HTTP ${response.status}` };
+        }
 
-            const responseText = await response.text();
-            try {
-                responseData = responseText ? JSON.parse(responseText) : {};
-            } catch (parseError) {
-                responseData = { detail: responseText || `HTTP ${response.status}` };
-            }
-
-            if (!response.ok) {
-                throw new Error(responseData.detail || responseData.message || `HTTP ${response.status}`);
-            }
-        } else {
-            const payload = buildItemPublishJsonPayload(values, itemPublishLoadedMaterialImages);
-            responseData = await requestItemPublishJson('/product-publish', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
+        if (!response.ok) {
+            const errorMessage = responseData.detail || responseData.message || `HTTP ${response.status}`;
+            renderItemPublishResult({ message: errorMessage, detail: errorMessage }, false);
+            showToast(errorMessage, 'danger');
+            return;
         }
 
         renderItemPublishResult(responseData, true);
         showToast(responseData.message || '商品发布成功', 'success');
-        await loadItemPublishLogs();
     } catch (error) {
         console.error('发布商品失败:', error);
         const errorMessage = error.message || '发布商品失败';
@@ -14081,12 +14475,28 @@ function handleQRCodeSuccess(data) {
         showToast(successMessage, 'success');
     }
 
+    setTimeout(() => {
+        showSection('accounts');
+        refreshAccountConnectWizard({ silent: true })
+            .then(() => {
+                highlightAccountConnectWizard();
+            })
+            .catch(error => console.error('刷新快速连接向导失败:', error));
+    }, 1200);
     closeQRCodeLoginModal(3000);
     return;
     }
 
     document.getElementById('statusText').textContent = '登录成功！';
     showToast(data.message || '扫码登录已完成，账号信息已同步', 'success');
+    setTimeout(() => {
+        showSection('accounts');
+        refreshAccountConnectWizard({ silent: true })
+            .then(() => {
+                highlightAccountConnectWizard();
+            })
+            .catch(error => console.error('刷新快速连接向导失败:', error));
+    }, 1200);
     closeQRCodeLoginModal(1500);
 }
 
@@ -17600,9 +18010,6 @@ async function confirmDeleteRecord() {
 // ================================
 let logAutoRefreshInterval = null;
 let currentLogLevel = '';
-let currentLogCenterTab = 'system';
-let taskLogRows = [];
-let taskLogCookieOptionsLoaded = false;
 
 // 加载系统日志
 async function loadSystemLogs() {
@@ -17743,249 +18150,6 @@ function scrollLogToTop() {
 function scrollLogToBottom() {
     const logContainer = document.getElementById('systemLogContainer');
     logContainer.scrollTop = logContainer.scrollHeight;
-}
-
-// 切换日志中心页签
-function switchLogCenterTab(tabName) {
-    currentLogCenterTab = tabName === 'task' ? 'task' : 'system';
-
-    const systemTab = document.getElementById('systemLogsTab');
-    const taskTab = document.getElementById('taskLogsTab');
-    const systemPane = document.getElementById('systemLogsPane');
-    const taskPane = document.getElementById('taskLogsPane');
-
-    if (systemTab) {
-        systemTab.classList.toggle('active', currentLogCenterTab === 'system');
-        systemTab.setAttribute('aria-selected', currentLogCenterTab === 'system' ? 'true' : 'false');
-    }
-    if (taskTab) {
-        taskTab.classList.toggle('active', currentLogCenterTab === 'task');
-        taskTab.setAttribute('aria-selected', currentLogCenterTab === 'task' ? 'true' : 'false');
-    }
-    if (systemPane) systemPane.classList.toggle('active', currentLogCenterTab === 'system');
-    if (taskPane) taskPane.classList.toggle('active', currentLogCenterTab === 'task');
-
-    if (currentLogCenterTab === 'task') {
-        initTaskLogsPane();
-    } else if (document.getElementById('systemLogContainer')) {
-        loadSystemLogs();
-    }
-}
-
-async function initTaskLogsPane() {
-    await loadTaskLogCookieOptions();
-    if (!taskLogRows.length) {
-        await loadTaskLogs();
-    } else {
-        renderTaskLogs();
-    }
-}
-
-async function loadTaskLogCookieOptions() {
-    const select = document.getElementById('taskLogCookieFilter');
-    if (!select || taskLogCookieOptionsLoaded) return;
-
-    try {
-        const response = await fetch(`${apiBase}/cookies/details`, {
-            headers: { 'Authorization': `Bearer ${getAuthToken()}` }
-        });
-        if (!response.ok) return;
-
-        const accounts = await response.json();
-        const currentValue = select.value;
-        select.innerHTML = '<option value="">全部账号</option>';
-        (Array.isArray(accounts) ? accounts : []).forEach(account => {
-            const option = document.createElement('option');
-            option.value = account.id || '';
-            const remark = account.remark ? `（${account.remark}）` : '';
-            option.textContent = `${account.id || '未知账号'}${remark}`;
-            select.appendChild(option);
-        });
-        select.value = currentValue;
-        taskLogCookieOptionsLoaded = true;
-    } catch (error) {
-        console.warn('加载任务日志账号筛选失败:', error);
-    }
-}
-
-async function loadTaskLogs() {
-    const loading = document.getElementById('loadingTaskLogs');
-    const table = document.getElementById('taskLogsTable');
-    const empty = document.getElementById('noTaskLogs');
-    const type = document.getElementById('taskLogTypeFilter')?.value || 'all';
-    const cookieId = document.getElementById('taskLogCookieFilter')?.value || '';
-    const limit = document.getElementById('taskLogLimit')?.value || '100';
-
-    if (loading) loading.style.display = 'block';
-    if (table) table.style.display = 'none';
-    if (empty) empty.style.display = 'none';
-
-    try {
-        const query = new URLSearchParams({ task_type: type, limit, offset: '0' });
-        if (cookieId) query.set('cookie_id', cookieId);
-
-        const response = await fetch(`${apiBase}/api/task-logs?${query.toString()}`, {
-            headers: { 'Authorization': `Bearer ${getAuthToken()}` }
-        });
-        if (!response.ok) {
-            throw new Error(`任务日志加载失败: HTTP ${response.status}`);
-        }
-        const data = await response.json();
-        taskLogRows = (data.data || []).map(log => normalizeTaskLog(log)).sort((a, b) => {
-            const timeA = new Date(a.created_at || 0).getTime();
-            const timeB = new Date(b.created_at || 0).getTime();
-            return timeB - timeA;
-        });
-
-        renderTaskLogs();
-        const lastUpdate = document.getElementById('taskLogsLastUpdate');
-        if (lastUpdate) lastUpdate.textContent = '最后更新: ' + new Date().toLocaleTimeString('zh-CN');
-    } catch (error) {
-        console.error('加载任务日志失败:', error);
-        if (empty) {
-            empty.style.display = 'block';
-            empty.innerHTML = `
-                <i class="bi bi-exclamation-triangle" style="font-size: 3rem; color: #dc3545;"></i>
-                <p class="mt-2 text-danger mb-0">加载任务日志失败：${escapeHtml(error.message || '未知错误')}</p>
-            `;
-        }
-        showToast('加载任务日志失败', 'danger');
-    } finally {
-        if (loading) loading.style.display = 'none';
-    }
-}
-
-function normalizeTaskLog(log) {
-    const type = log.task_type || 'other_task';
-    return {
-        ...log,
-        task_type: type,
-        task_label: log.task_label || getTaskTypeLabel(type),
-        display_object: log.object_id || log.order_id || log.item_id || '-',
-        created_at: log.created_at || log.updated_at || ''
-    };
-}
-
-function renderTaskLogs() {
-    const tbody = document.getElementById('taskLogsTableBody');
-    const table = document.getElementById('taskLogsTable');
-    const empty = document.getElementById('noTaskLogs');
-    const statusFilter = document.getElementById('taskLogStatusFilter')?.value || 'all';
-    if (!tbody || !table || !empty) return;
-
-    const filtered = taskLogRows.filter(log => matchTaskLogStatusFilter(log.status, statusFilter));
-    updateTaskLogStats(filtered);
-
-    if (!filtered.length) {
-        table.style.display = 'none';
-        empty.style.display = 'block';
-        empty.innerHTML = `
-            <i class="bi bi-journal-text" style="font-size: 3rem; color: #ccc;"></i>
-            <p class="mt-2 text-muted mb-0">暂无任务日志</p>
-        `;
-        tbody.innerHTML = '';
-        return;
-    }
-
-    tbody.innerHTML = filtered.map(log => `
-        <tr>
-            <td class="text-nowrap">${escapeHtml(formatTaskLogTime(log.created_at))}</td>
-            <td>${renderTaskTypeBadge(log.task_type, log.task_label)}</td>
-            <td><span class="task-log-account" title="${escapeHtml(log.cookie_id || '')}">${escapeHtml(log.cookie_id || '-')}</span></td>
-            <td><span class="task-log-object" title="${escapeHtml(log.display_object || '')}">${escapeHtml(log.display_object || '-')}</span></td>
-            <td>${escapeHtml(log.buyer_nick || log.buyer_id || '-')}</td>
-            <td>${renderTaskStatusBadge(log.status)}</td>
-            <td class="task-log-message" title="${escapeHtml(log.message || '')}">${escapeHtml(log.message || '-')}</td>
-            <td><span class="task-log-batch" title="${escapeHtml(log.batch_id || '')}">${escapeHtml(shortenTaskLogBatchId(log.batch_id))}</span></td>
-        </tr>
-    `).join('');
-    table.style.display = 'table';
-    empty.style.display = 'none';
-}
-
-function matchTaskLogStatusFilter(status, filter) {
-    if (!filter || filter === 'all') return true;
-    const value = String(status || '').toLowerCase();
-    if (filter === 'success') return ['success', 'partial_success', 'already_rated', 'already_red_flower'].includes(value);
-    if (filter === 'skipped') return ['skipped', 'missing_template'].includes(value);
-    if (filter === 'cookie_expired') return ['cookie_expired', 'session_expired'].includes(value);
-    if (filter === 'processing') return ['processing', 'started', 'running'].includes(value);
-    return value === filter;
-}
-
-function updateTaskLogStats(rows) {
-    const total = rows.length;
-    const success = rows.filter(row => matchTaskLogStatusFilter(row.status, 'success')).length;
-    const failed = rows.filter(row => String(row.status || '').toLowerCase() === 'failed').length;
-    const skipped = rows.filter(row => matchTaskLogStatusFilter(row.status, 'skipped') || matchTaskLogStatusFilter(row.status, 'cookie_expired')).length;
-
-    setTextContent('taskLogTotalCount', total);
-    setTextContent('taskLogSuccessCount', success);
-    setTextContent('taskLogFailedCount', failed);
-    setTextContent('taskLogSkippedCount', skipped);
-}
-
-function setTextContent(id, value) {
-    const el = document.getElementById(id);
-    if (el) el.textContent = String(value);
-}
-
-function getTaskTypeLabel(type) {
-    const labels = {
-        auto_comment: '自动评价',
-        auto_red_flower: '求小红花',
-        item_polish: '商品擦亮',
-        login_renew: '登录续期',
-        cookie_refresh: 'Cookie刷新',
-        other_task: '其他任务'
-    };
-    return labels[type] || '其他任务';
-}
-
-function renderTaskTypeBadge(type, label) {
-    const config = {
-        auto_comment: ['chat-heart', 'task-type-comment'],
-        auto_red_flower: ['flower1', 'task-type-red-flower'],
-        item_polish: ['stars', 'task-type-polish'],
-        login_renew: ['shield-check', 'task-type-login'],
-        cookie_refresh: ['arrow-repeat', 'task-type-cookie'],
-        other_task: ['box-seam', 'task-type-other']
-    };
-    const [icon, cls] = config[type] || config.other_task;
-    return `<span class="task-type-badge ${cls}"><i class="bi bi-${icon}"></i>${escapeHtml(label || getTaskTypeLabel(type))}</span>`;
-}
-
-function renderTaskStatusBadge(status) {
-    const value = String(status || '').toLowerCase();
-    const map = {
-        success: ['bg-success', '成功'],
-        failed: ['bg-danger', '失败'],
-        skipped: ['bg-secondary', '已跳过'],
-        cookie_expired: ['bg-warning text-dark', 'Cookie过期'],
-        session_expired: ['bg-warning text-dark', 'Session过期'],
-        processing: ['bg-info', '处理中'],
-        started: ['bg-info', '处理中'],
-        running: ['bg-info', '运行中'],
-        partial_success: ['bg-primary', '部分成功'],
-        already_rated: ['bg-success', '已评价'],
-        already_red_flower: ['bg-success', '已求小红花'],
-        missing_template: ['bg-secondary', '缺少模板']
-    };
-    const [cls, text] = map[value] || ['bg-secondary', status || '未知'];
-    return `<span class="badge ${cls}">${escapeHtml(text)}</span>`;
-}
-
-function formatTaskLogTime(value) {
-    if (!value) return '-';
-    const date = parseUtcDateTime(value) || new Date(value);
-    if (Number.isNaN(date.getTime())) return value;
-    return date.toLocaleString('zh-CN');
-}
-
-function shortenTaskLogBatchId(batchId) {
-    if (!batchId) return '-';
-    const value = String(batchId);
-    return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
 // 打开日志导出模态框
@@ -19362,7 +19526,582 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v2.0.1';
+// ================================
+// Item monitor task feature
+// ================================
+let itemMonitorTasks = [];
+let itemMonitorResults = [];
+let monitorAdvisorState = {
+    product: '',
+    currentQuestion: '',
+    answers: []
+};
+
+function getMonitorFieldValue(id) {
+    return document.getElementById(id)?.value.trim() || '';
+}
+
+function setMonitorFieldValue(id, value) {
+    const field = document.getElementById(id);
+    if (field) field.value = value ?? '';
+}
+
+function splitMonitorWizardTerms(value) {
+    return String(value || '')
+        .split(/[\s,，、;；|/]+/)
+        .map(item => item.trim())
+        .filter(Boolean);
+}
+
+function joinMonitorWizardTerms(...groups) {
+    const seen = new Set();
+    const result = [];
+    groups.flat().forEach(term => {
+        const normalized = String(term || '').trim();
+        if (!normalized || seen.has(normalized)) return;
+        seen.add(normalized);
+        result.push(normalized);
+    });
+    return result.join(' ');
+}
+
+function getAuthHeaders() {
+    return {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
+    };
+}
+
+function initItemMonitor() {
+    const form = document.getElementById('itemMonitorTaskForm');
+    if (form && !form.dataset.bound) {
+        form.addEventListener('submit', handleItemMonitorSubmit);
+        form.dataset.bound = 'true';
+    }
+}
+
+function getItemMonitorPayload() {
+    const minPriceValue = document.getElementById('monitorMinPrice')?.value.trim() || '';
+    const maxPriceValue = document.getElementById('monitorMaxPrice')?.value.trim() || '';
+    const totalPages = parseInt(document.getElementById('monitorTotalPages')?.value, 10) || 1;
+    const intervalMinutes = parseInt(document.getElementById('monitorIntervalMinutes')?.value, 10) || 60;
+
+    return {
+        name: document.getElementById('monitorTaskName').value.trim(),
+        keyword: document.getElementById('monitorKeyword').value.trim(),
+        min_price: minPriceValue === '' ? null : Number(minPriceValue),
+        max_price: maxPriceValue === '' ? null : Number(maxPriceValue),
+        area: document.getElementById('monitorArea').value.trim(),
+        exclude_keywords: document.getElementById('monitorExcludeKeywords').value.trim(),
+        required_keywords: getMonitorFieldValue('monitorRequiredKeywords'),
+        seller_keywords: getMonitorFieldValue('monitorSellerKeywords'),
+        shipping_requirements: getMonitorFieldValue('monitorShippingRequirements'),
+        condition_requirements: getMonitorFieldValue('monitorConditionRequirements'),
+        monitor_profile: getMonitorFieldValue('monitorProfile'),
+        total_pages: Math.min(Math.max(totalPages, 1), 20),
+        interval_minutes: Math.min(Math.max(intervalMinutes, 10), 1440),
+        enabled: document.getElementById('monitorEnabled').checked
+    };
+}
+
+function resetItemMonitorForm() {
+    const form = document.getElementById('itemMonitorTaskForm');
+    if (!form) return;
+    form.reset();
+    document.getElementById('itemMonitorTaskId').value = '';
+    document.getElementById('monitorTotalPages').value = '1';
+    document.getElementById('monitorIntervalMinutes').value = '60';
+    document.getElementById('monitorEnabled').checked = true;
+    ['monitorRequiredKeywords', 'monitorSellerKeywords', 'monitorShippingRequirements', 'monitorConditionRequirements', 'monitorProfile'].forEach(id => setMonitorFieldValue(id, ''));
+    const submitButton = form.querySelector('button[type="submit"]');
+    if (submitButton) {
+        submitButton.innerHTML = '<i class="bi bi-plus-circle me-1"></i>保存监控任务';
+    }
+}
+
+function resetMonitorWizard() {
+    monitorAdvisorState = { product: '', currentQuestion: '', answers: [] };
+    ['monitorAdvisorProduct', 'monitorAdvisorMaxPrice', 'monitorAdvisorArea', 'monitorAdvisorAnswer'].forEach(id => setMonitorFieldValue(id, ''));
+    renderMonitorAdvisorChat();
+    document.getElementById('monitorAdvisorAnswerRow')?.classList.add('d-none');
+    document.getElementById('monitorAdvisorFinalizeBtn')?.classList.add('d-none');
+    const advisorSummary = document.getElementById('monitorAdvisorSummary');
+    if (advisorSummary) advisorSummary.textContent = 'AI会根据商品特性实时追问，再生成下方监控任务。';
+
+    [
+        'monitorWizardProduct', 'monitorWizardMinPrice', 'monitorWizardMaxPrice',
+        'monitorWizardCondition', 'monitorWizardShipping', 'monitorWizardArea',
+        'monitorWizardSeller', 'monitorWizardExclude'
+    ].forEach(id => setMonitorFieldValue(id, ''));
+    const summary = document.getElementById('monitorWizardSummary');
+    if (summary) summary.textContent = '回答问题后，可自动生成下方监控任务。';
+}
+
+function getMonitorAdvisorBasePayload() {
+    const maxPriceValue = getMonitorFieldValue('monitorAdvisorMaxPrice');
+    return {
+        product: getMonitorFieldValue('monitorAdvisorProduct') || monitorAdvisorState.product,
+        max_price: maxPriceValue === '' ? null : Number(maxPriceValue),
+        area: getMonitorFieldValue('monitorAdvisorArea'),
+        answers: monitorAdvisorState.answers
+    };
+}
+
+function renderMonitorAdvisorChat() {
+    const container = document.getElementById('monitorAdvisorChat');
+    if (!container) return;
+    const rows = [];
+    monitorAdvisorState.answers.forEach((item, index) => {
+        rows.push(`
+            <div class="item-monitor-advisor-message advisor">
+                <strong>Q${index + 1}</strong>
+                <span>${escapeHtml(item.question || '')}</span>
+            </div>
+            <div class="item-monitor-advisor-message user">
+                <strong>A${index + 1}</strong>
+                <span>${escapeHtml(item.answer || '')}</span>
+            </div>
+        `);
+    });
+    if (monitorAdvisorState.currentQuestion) {
+        rows.push(`
+            <div class="item-monitor-advisor-message advisor">
+                <strong>AI</strong>
+                <span>${escapeHtml(monitorAdvisorState.currentQuestion)}</span>
+            </div>
+        `);
+    }
+    container.innerHTML = rows.length
+        ? rows.join('')
+        : '<div class="item-monitor-advisor-empty">输入商品后，AI会按该品类的风险点继续追问。</div>';
+}
+
+async function requestMonitorAdvisorQuestion() {
+    const payload = getMonitorAdvisorBasePayload();
+    if (!payload.product) {
+        showToast('先填写你想找什么商品', 'warning');
+        return;
+    }
+    monitorAdvisorState.product = payload.product;
+    const response = await fetch('/api/item-monitor/advisor/next-question', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) {
+        throw new Error(data.detail || data.message || 'AI提问失败');
+    }
+    monitorAdvisorState.currentQuestion = data.ready ? '' : (data.question || '');
+    renderMonitorAdvisorChat();
+    document.getElementById('monitorAdvisorAnswerRow')?.classList.toggle('d-none', Boolean(data.ready));
+    document.getElementById('monitorAdvisorFinalizeBtn')?.classList.toggle('d-none', !data.ready);
+    const summary = document.getElementById('monitorAdvisorSummary');
+    if (summary) summary.textContent = data.ready ? '信息已足够，可以生成精准监控条件。' : (data.reason || '请回答 AI 的问题。');
+}
+
+async function startMonitorAdvisor() {
+    try {
+        monitorAdvisorState = { product: getMonitorFieldValue('monitorAdvisorProduct'), currentQuestion: '', answers: [] };
+        setMonitorFieldValue('monitorAdvisorAnswer', '');
+        renderMonitorAdvisorChat();
+        await requestMonitorAdvisorQuestion();
+    } catch (error) {
+        console.error('start monitor advisor failed:', error);
+        showToast(error.message || 'AI提问失败', 'danger');
+    }
+}
+
+async function submitMonitorAdvisorAnswer() {
+    const answer = getMonitorFieldValue('monitorAdvisorAnswer');
+    if (!monitorAdvisorState.currentQuestion) {
+        showToast('当前没有需要回答的问题', 'warning');
+        return;
+    }
+    if (!answer) {
+        showToast('先填写你的回答', 'warning');
+        return;
+    }
+    monitorAdvisorState.answers.push({
+        question: monitorAdvisorState.currentQuestion,
+        answer
+    });
+    monitorAdvisorState.currentQuestion = '';
+    setMonitorFieldValue('monitorAdvisorAnswer', '');
+    renderMonitorAdvisorChat();
+    try {
+        await requestMonitorAdvisorQuestion();
+    } catch (error) {
+        console.error('submit monitor advisor answer failed:', error);
+        showToast(error.message || 'AI继续提问失败', 'danger');
+    }
+}
+
+async function finalizeMonitorAdvisor() {
+    const payload = getMonitorAdvisorBasePayload();
+    if (!payload.product) {
+        showToast('先填写你想找什么商品', 'warning');
+        return;
+    }
+    try {
+        const response = await fetch('/api/item-monitor/advisor/finalize', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || data.message || '生成监控条件失败');
+        }
+        const conditions = data.conditions || {};
+        setMonitorFieldValue('monitorTaskName', conditions.name || `${payload.product} AI需求监控`);
+        setMonitorFieldValue('monitorKeyword', conditions.keyword || payload.product);
+        setMonitorFieldValue('monitorMinPrice', conditions.min_price ?? '');
+        setMonitorFieldValue('monitorMaxPrice', conditions.max_price ?? '');
+        setMonitorFieldValue('monitorArea', conditions.area || payload.area || '');
+        setMonitorFieldValue('monitorExcludeKeywords', conditions.exclude_keywords || '');
+        setMonitorFieldValue('monitorRequiredKeywords', conditions.required_keywords || '');
+        setMonitorFieldValue('monitorSellerKeywords', conditions.seller_keywords || '');
+        setMonitorFieldValue('monitorShippingRequirements', conditions.shipping_requirements || '');
+        setMonitorFieldValue('monitorConditionRequirements', conditions.condition_requirements || '');
+        setMonitorFieldValue('monitorProfile', conditions.monitor_profile || JSON.stringify({ product: payload.product, answers: payload.answers }));
+        const summary = document.getElementById('monitorAdvisorSummary');
+        if (summary) summary.textContent = conditions.summary || '已生成监控条件，请检查后保存任务。';
+        showToast('已生成精准监控条件，请检查后保存任务', 'success');
+        document.getElementById('itemMonitorTaskForm')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (error) {
+        console.error('finalize monitor advisor failed:', error);
+        showToast(error.message || '生成监控条件失败', 'danger');
+    }
+}
+
+function applyMonitorWizard() {
+    const product = getMonitorFieldValue('monitorWizardProduct');
+    if (!product) {
+        showToast('先填写你想找什么商品', 'warning');
+        return;
+    }
+
+    const condition = getMonitorFieldValue('monitorWizardCondition');
+    const shipping = getMonitorFieldValue('monitorWizardShipping');
+    const area = getMonitorFieldValue('monitorWizardArea');
+    const seller = getMonitorFieldValue('monitorWizardSeller');
+    const exclude = getMonitorFieldValue('monitorWizardExclude');
+    const minPrice = getMonitorFieldValue('monitorWizardMinPrice');
+    const maxPrice = getMonitorFieldValue('monitorWizardMaxPrice');
+    const requiredKeywords = joinMonitorWizardTerms(
+        splitMonitorWizardTerms(condition),
+        splitMonitorWizardTerms(shipping)
+    );
+    const profile = {
+        product,
+        budget: { min: minPrice, max: maxPrice },
+        condition,
+        shipping,
+        area,
+        seller,
+        exclude
+    };
+
+    setMonitorFieldValue('monitorTaskName', `${product} 需求监控`);
+    setMonitorFieldValue('monitorKeyword', product);
+    setMonitorFieldValue('monitorMinPrice', minPrice);
+    setMonitorFieldValue('monitorMaxPrice', maxPrice);
+    setMonitorFieldValue('monitorArea', area);
+    setMonitorFieldValue('monitorExcludeKeywords', exclude);
+    setMonitorFieldValue('monitorRequiredKeywords', requiredKeywords);
+    setMonitorFieldValue('monitorSellerKeywords', seller);
+    setMonitorFieldValue('monitorShippingRequirements', shipping);
+    setMonitorFieldValue('monitorConditionRequirements', condition);
+    setMonitorFieldValue('monitorProfile', JSON.stringify(profile));
+
+    const summaryParts = [
+        product,
+        maxPrice ? `最高 ${maxPrice}` : '',
+        area ? `地区 ${area}` : '',
+        requiredKeywords ? `要求 ${requiredKeywords}` : '',
+        seller ? `卖家 ${seller}` : ''
+    ].filter(Boolean);
+    const summary = document.getElementById('monitorWizardSummary');
+    if (summary) summary.textContent = `已生成：${summaryParts.join(' / ')}`;
+    showToast('已根据回答生成监控条件，请检查后保存任务', 'success');
+}
+
+async function loadItemMonitor() {
+    initItemMonitor();
+    await Promise.all([
+        loadItemMonitorTasks(),
+        loadItemMonitorResults()
+    ]);
+}
+
+async function loadItemMonitorTasks() {
+    const container = document.getElementById('itemMonitorTaskList');
+    if (container) {
+        container.innerHTML = '<div class="text-muted text-center py-4">正在加载监控任务...</div>';
+    }
+
+    try {
+        const response = await fetch('/api/item-monitor/tasks', {
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || data.message || '加载监控任务失败');
+        }
+        itemMonitorTasks = data.tasks || data.data || [];
+        renderItemMonitorTasks();
+    } catch (error) {
+        console.error('load item monitor tasks failed:', error);
+        if (container) {
+            container.innerHTML = '<div class="text-danger text-center py-4">监控任务加载失败</div>';
+        }
+        showToast(error.message || '监控任务加载失败', 'danger');
+    }
+}
+
+async function loadItemMonitorResults(taskId = null) {
+    const container = document.getElementById('itemMonitorResultList');
+    if (container) {
+        container.innerHTML = '<div class="text-muted text-center py-4">正在加载监控结果...</div>';
+    }
+
+    try {
+        const params = new URLSearchParams({ limit: '100' });
+        if (taskId) params.set('task_id', taskId);
+        const response = await fetch(`/api/item-monitor/results?${params.toString()}`, {
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || data.message || '加载监控结果失败');
+        }
+        itemMonitorResults = data.results || data.data || [];
+        renderItemMonitorResults();
+    } catch (error) {
+        console.error('load item monitor results failed:', error);
+        if (container) {
+            container.innerHTML = '<div class="text-danger text-center py-4">监控结果加载失败</div>';
+        }
+        showToast(error.message || '监控结果加载失败', 'danger');
+    }
+}
+
+async function handleItemMonitorSubmit(event) {
+    event.preventDefault();
+    const payload = getItemMonitorPayload();
+    const taskId = document.getElementById('itemMonitorTaskId').value;
+
+    if (!payload.name || !payload.keyword) {
+        showToast('请填写任务名称和搜索关键词', 'warning');
+        return;
+    }
+    if (payload.min_price !== null && payload.max_price !== null && payload.min_price > payload.max_price) {
+        showToast('最低价不能高于最高价', 'warning');
+        return;
+    }
+
+    try {
+        const response = await fetch(taskId ? `/api/item-monitor/tasks/${taskId}` : '/api/item-monitor/tasks', {
+            method: taskId ? 'PUT' : 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || data.message || '保存监控任务失败');
+        }
+        showToast(taskId ? '监控任务已更新' : '监控任务已创建', 'success');
+        resetItemMonitorForm();
+        await loadItemMonitorTasks();
+    } catch (error) {
+        console.error('save item monitor task failed:', error);
+        showToast(error.message || '保存监控任务失败', 'danger');
+    }
+}
+
+function renderItemMonitorTasks() {
+    const container = document.getElementById('itemMonitorTaskList');
+    const countBadge = document.getElementById('itemMonitorTaskCount');
+    if (countBadge) countBadge.textContent = itemMonitorTasks.length;
+    if (!container) return;
+
+    if (itemMonitorTasks.length === 0) {
+        container.innerHTML = '<div class="text-muted text-center py-4">还没有监控任务，先在左侧创建一个。</div>';
+        return;
+    }
+
+    container.innerHTML = itemMonitorTasks.map(task => `
+        <div class="item-monitor-task ${task.enabled ? '' : 'is-disabled'}">
+            <div class="item-monitor-task-main">
+                <div class="d-flex align-items-center justify-content-between gap-2">
+                    <h6 class="mb-0">${escapeHtml(task.name || '')}</h6>
+                    <span class="badge ${task.enabled ? 'bg-success' : 'bg-secondary'}">${task.enabled ? '运行中' : '已停用'}</span>
+                </div>
+                <div class="item-monitor-meta mt-2">
+                    <span><i class="bi bi-search me-1"></i>${escapeHtml(task.keyword || '')}</span>
+                    ${task.min_price !== null && task.min_price !== undefined ? `<span>最低 ${escapeHtml(String(task.min_price))}</span>` : ''}
+                    ${task.max_price !== null && task.max_price !== undefined ? `<span>最高 ${escapeHtml(String(task.max_price))}</span>` : ''}
+                    ${task.area ? `<span>${escapeHtml(task.area)}</span>` : ''}
+                    ${task.required_keywords ? `<span>要求 ${escapeHtml(task.required_keywords)}</span>` : ''}
+                    ${task.seller_keywords ? `<span>卖家 ${escapeHtml(task.seller_keywords)}</span>` : ''}
+                    <span>${escapeHtml(String(task.interval_minutes || 60))} 分钟</span>
+                </div>
+                <div class="item-monitor-submeta mt-2">
+                    最近执行：${escapeHtml(task.last_run_at || '尚未执行')} · 结果：${escapeHtml(String(task.last_result_count || 0))} 条
+                </div>
+                ${task.last_error ? `<div class="item-monitor-error mt-2">${escapeHtml(task.last_error)}</div>` : ''}
+            </div>
+            <div class="item-monitor-actions">
+                <button class="btn btn-sm btn-outline-primary" onclick="runItemMonitorTask(${task.id})"><i class="bi bi-play-circle"></i> 立即执行</button>
+                <button class="btn btn-sm btn-outline-secondary" onclick="loadItemMonitorResults(${task.id})"><i class="bi bi-list-ul"></i> 看结果</button>
+                <button class="btn btn-sm btn-outline-secondary" onclick="editItemMonitorTask(${task.id})"><i class="bi bi-pencil"></i> 编辑</button>
+                <button class="btn btn-sm ${task.enabled ? 'btn-outline-warning' : 'btn-outline-success'}" onclick="toggleItemMonitorTask(${task.id}, ${task.enabled ? 'false' : 'true'})">
+                    <i class="bi ${task.enabled ? 'bi-pause-circle' : 'bi-play-circle'}"></i> ${task.enabled ? '停用' : '启用'}
+                </button>
+                <button class="btn btn-sm btn-outline-danger" onclick="deleteItemMonitorTask(${task.id})"><i class="bi bi-trash"></i> 删除</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+function renderItemMonitorResults() {
+    const container = document.getElementById('itemMonitorResultList');
+    if (!container) return;
+
+    if (itemMonitorResults.length === 0) {
+        container.innerHTML = '<div class="text-muted text-center py-4">暂无监控结果。创建任务后点“立即执行”可以马上抓一次。</div>';
+        return;
+    }
+
+    container.innerHTML = itemMonitorResults.map(item => {
+        const itemUrl = item.item_url || '#';
+        const imageUrl = item.image_url || '';
+        const rawData = parseItemMonitorRawJson(item.raw_json);
+        const notes = Array.isArray(rawData._monitor_match_notes) ? rawData._monitor_match_notes : [];
+        return `
+            <div class="item-monitor-result">
+                ${imageUrl ? `<img class="item-monitor-result-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(item.title || '')}" onerror="this.style.display='none'">` : ''}
+                <div class="item-monitor-result-body">
+                    <div class="d-flex align-items-start justify-content-between gap-2">
+                        <h6 class="mb-1">${escapeHtml(item.title || '')}</h6>
+                        <span class="item-monitor-price">${escapeHtml(item.price || '')}</span>
+                    </div>
+                    <div class="item-monitor-meta">
+                        ${item.area ? `<span><i class="bi bi-geo-alt me-1"></i>${escapeHtml(item.area)}</span>` : ''}
+                        ${item.seller_name ? `<span><i class="bi bi-person me-1"></i>${escapeHtml(item.seller_name)}</span>` : ''}
+                        ${item.keyword ? `<span><i class="bi bi-search me-1"></i>${escapeHtml(item.keyword)}</span>` : ''}
+                    </div>
+                    <div class="item-monitor-submeta mt-2">首次发现：${escapeHtml(item.first_seen_at || '')}</div>
+                    ${notes.length ? `<div class="item-monitor-reason mt-2"><strong>推荐理由</strong>${notes.map(note => `<span>${escapeHtml(note)}</span>`).join('')}</div>` : ''}
+                    <a class="btn btn-sm btn-primary mt-2" target="_blank" href="${escapeHtml(itemUrl)}"><i class="bi bi-box-arrow-up-right me-1"></i>打开商品</a>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function parseItemMonitorRawJson(rawJson) {
+    if (!rawJson) return {};
+    try {
+        return JSON.parse(rawJson);
+    } catch (error) {
+        return {};
+    }
+}
+
+function editItemMonitorTask(id) {
+    const task = itemMonitorTasks.find(item => Number(item.id) === Number(id));
+    if (!task) return;
+    document.getElementById('itemMonitorTaskId').value = task.id;
+    document.getElementById('monitorTaskName').value = task.name || '';
+    document.getElementById('monitorKeyword').value = task.keyword || '';
+    document.getElementById('monitorMinPrice').value = task.min_price ?? '';
+    document.getElementById('monitorMaxPrice').value = task.max_price ?? '';
+    document.getElementById('monitorArea').value = task.area || '';
+    document.getElementById('monitorExcludeKeywords').value = task.exclude_keywords || '';
+    setMonitorFieldValue('monitorRequiredKeywords', task.required_keywords || '');
+    setMonitorFieldValue('monitorSellerKeywords', task.seller_keywords || '');
+    setMonitorFieldValue('monitorShippingRequirements', task.shipping_requirements || '');
+    setMonitorFieldValue('monitorConditionRequirements', task.condition_requirements || '');
+    setMonitorFieldValue('monitorProfile', task.monitor_profile || '');
+    document.getElementById('monitorTotalPages').value = task.total_pages || 1;
+    document.getElementById('monitorIntervalMinutes').value = task.interval_minutes || 60;
+    document.getElementById('monitorEnabled').checked = Boolean(task.enabled);
+    const submitButton = document.querySelector('#itemMonitorTaskForm button[type="submit"]');
+    if (submitButton) {
+        submitButton.innerHTML = '<i class="bi bi-check-circle me-1"></i>更新监控任务';
+    }
+    document.getElementById('item-monitor-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function toggleItemMonitorTask(id, enabled) {
+    const task = itemMonitorTasks.find(item => Number(item.id) === Number(id));
+    if (!task) return;
+    try {
+        const response = await fetch(`/api/item-monitor/tasks/${id}`, {
+            method: 'PUT',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ ...task, enabled })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || data.message || '更新任务状态失败');
+        }
+        showToast(enabled ? '监控任务已启用' : '监控任务已停用', 'success');
+        await loadItemMonitorTasks();
+    } catch (error) {
+        console.error('toggle item monitor task failed:', error);
+        showToast(error.message || '更新任务状态失败', 'danger');
+    }
+}
+
+async function runItemMonitorTask(id) {
+    try {
+        showToast('正在执行监控任务，请稍等', 'info');
+        const response = await fetch(`/api/item-monitor/tasks/${id}/run`, {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || data.message || '执行监控任务失败');
+        }
+        const runData = data.data || data;
+        showToast(`执行完成，保存 ${runData.saved_count || 0} 条，匹配 ${runData.matched_count || 0} 条`, 'success');
+        await Promise.all([
+            loadItemMonitorTasks(),
+            loadItemMonitorResults(id)
+        ]);
+    } catch (error) {
+        console.error('run item monitor task failed:', error);
+        showToast(error.message || '执行监控任务失败', 'danger');
+    }
+}
+
+async function deleteItemMonitorTask(id) {
+    if (!confirm('确定删除这个监控任务吗？对应的历史结果也会删除。')) return;
+    try {
+        const response = await fetch(`/api/item-monitor/tasks/${id}`, {
+            method: 'DELETE',
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || data.message || '删除监控任务失败');
+        }
+        showToast('监控任务已删除', 'success');
+        resetItemMonitorForm();
+        await Promise.all([
+            loadItemMonitorTasks(),
+            loadItemMonitorResults()
+        ]);
+    } catch (error) {
+        console.error('delete item monitor task failed:', error);
+        showToast(error.message || '删除监控任务失败', 'danger');
+    }
+}
+const DEFAULT_VERSION = 'v2.0.0';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -19473,22 +20212,9 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v2.0.1',
+    version: 'v2.0.0',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
-        {
-            version: 'v2.0.1',
-            date: '2026-05-28',
-            updates: [
-                '【新功能】新增商品发布素材管理与批量发布能力，支持素材集中维护并批量执行发布任务',
-                '【新功能】新增历史订单补评价与自动求小红花流程，补齐订单售后运营自动化能力',
-                '【新功能】新增统一任务日志中心，集中查看任务执行日志并提升排查效率',
-                '【优化】仪表盘公告卡片支持摘要展示并优化卡片布局，同时允许关闭公告提示',
-                '【修复】修复在线客服 Web 端自发消息不显示、消息时间 UTC 偏移和系统文案污染买家昵称等问题',
-                '【修复】修复滑块验证后 _m_h5_tk 域名落点导致 Token 刷新非法请求，账密登录后优先快照 goofish 域 Token',
-                '【修复】修复自动评价接口调用链路，改为本地评价接口并补齐补评任务',
-            ]
-        },
         {
             version: 'v2.0.0',
             date: '2026-05-19',
@@ -21473,6 +22199,7 @@ let chatCurrentChatId = '';
 let chatCurrentToUserId = '';
 let chatCurrentSenderName = '';
 let chatCurrentItemId = '';
+let chatCurrentItemContext = null;
 let chatSessionsCache = [];
 let chatOldestMsgId = null;
 let chatSseAbortController = null;
@@ -21528,17 +22255,115 @@ function getChatSessionState(session) {
     };
 }
 
+function normalizeChatItemContext(source) {
+    if (!source) return null;
+    const context = { ...source };
+    if (source.item_context) {
+        Object.entries(source.item_context).forEach(([key, value]) => {
+            if (value !== undefined && value !== null && String(value).trim() !== '') {
+                context[key] = value;
+            }
+        });
+    }
+    const itemId = String(context.item_id || '').trim();
+    if (!itemId || itemId === 'None' || itemId.startsWith('auto_')) return null;
+    return {
+        item_id: itemId,
+        item_title: String(context.item_title || '').trim(),
+        item_price: String(context.item_price || context.order_amount || '').trim(),
+        item_image: String(context.item_image || context.item_pic || '').trim(),
+        item_jump_url: String(context.item_jump_url || context.detail_url || '').trim(),
+        order_detail_url: String(context.order_detail_url || '').trim(),
+        item_category: String(context.item_category || '').trim(),
+        item_detail_synced: Boolean(context.item_detail_synced),
+        order_status: String(context.order_status || context.order_status_name || '').trim(),
+        order_id: String(context.order_id || '').trim(),
+        order_updated_at: String(context.order_updated_at || '').trim(),
+        item_updated_at: String(context.item_updated_at || '').trim(),
+    };
+}
+
+function buildGoofishItemUrl(itemId) {
+    const safeItemId = String(itemId || '').trim();
+    return safeItemId ? `https://www.goofish.com/item?id=${encodeURIComponent(safeItemId)}` : '';
+}
+
+function copyChatItemId(itemId) {
+    const safeItemId = String(itemId || '').trim();
+    if (!safeItemId || !navigator.clipboard) return;
+    navigator.clipboard.writeText(safeItemId).catch(error => {
+        console.debug('复制商品ID失败:', error);
+    });
+}
+
+function toInlineJsString(value) {
+    return escapeHtml(JSON.stringify(String(value || '')));
+}
+
+function renderChatItemContext(context) {
+    const normalized = normalizeChatItemContext(context);
+    if (!normalized) return '';
+    const title = normalized.item_title || `商品 ${normalized.item_id}`;
+    const statusText = normalized.item_detail_synced ? '已同步商品详情' : '未同步商品详情';
+    const priceHtml = normalized.item_price ? `<span class="chat-item-price">￥${escapeHtml(normalized.item_price)}</span>` : '';
+    const orderStatusHtml = normalized.order_status ? `<span>${escapeHtml(normalized.order_status)}</span>` : '';
+    const categoryHtml = normalized.item_category ? `<span>${escapeHtml(normalized.item_category)}</span>` : '';
+    const updatedHtml = normalized.item_updated_at ? `<span>更新 ${escapeHtml(formatChatTime(normalized.item_updated_at))}</span>` : '';
+    const itemUrl = normalized.item_jump_url || normalized.order_detail_url || buildGoofishItemUrl(normalized.item_id);
+    const imageHtml = normalized.item_image
+        ? `<img src="${escapeHtml(normalized.item_image)}" alt="商品图" class="chat-item-thumb-img" onerror="this.closest('.chat-item-thumb').classList.add('is-empty'); this.remove();">`
+        : '<i class="bi bi-image"></i>';
+
+    return `
+        <div class="chat-item-thumb${normalized.item_image ? '' : ' is-empty'}">${imageHtml}</div>
+        <div class="chat-item-info">
+            <div class="chat-item-title" title="${escapeHtml(title)}">${escapeHtml(title)}</div>
+            <div class="chat-item-meta">
+                ${priceHtml}
+                ${orderStatusHtml}
+                ${categoryHtml}
+                <span>ID ${escapeHtml(normalized.item_id)}</span>
+                <span class="${normalized.item_detail_synced ? 'text-success' : 'text-warning'}">${statusText}</span>
+                ${updatedHtml}
+            </div>
+        </div>
+        <div class="chat-item-actions">
+            <button class="btn btn-sm btn-outline-secondary" type="button" title="复制商品ID" onclick="copyChatItemId(${toInlineJsString(normalized.item_id)})"><i class="bi bi-clipboard"></i></button>
+            ${itemUrl ? `<button class="btn btn-sm btn-outline-primary" type="button" title="查看商品" onclick="window.open(${toInlineJsString(itemUrl)}, '_blank')"><i class="bi bi-box-arrow-up-right"></i></button>` : ''}
+        </div>
+    `;
+}
+
+function updateChatItemContext(context) {
+    const panel = document.getElementById('chatItemContext');
+    if (!panel) return;
+    const normalized = normalizeChatItemContext({ ...(chatCurrentItemContext || {}), ...(context || {}) });
+    chatCurrentItemContext = normalized;
+    if (normalized?.item_id) {
+        chatCurrentItemId = normalized.item_id;
+    }
+    const html = renderChatItemContext(normalized);
+    if (!html) {
+        panel.classList.add('d-none');
+        panel.innerHTML = '';
+        return;
+    }
+    panel.innerHTML = html;
+    panel.classList.remove('d-none');
+}
+
 function updateChatHeaderMeta(session) {
     const headerItemId = document.getElementById('chatHeaderItemId');
     const headerMeta = document.getElementById('chatHeaderMeta');
+    const itemContext = normalizeChatItemContext(session);
     if (headerItemId) {
-        headerItemId.textContent = session?.item_id ? `商品: ${session.item_id}` : '';
+        headerItemId.textContent = itemContext?.item_id ? `商品: ${itemContext.item_id}` : '';
     }
     if (!headerMeta) return;
     const parts = [];
-    if (session?.item_title) parts.push(session.item_title);
-    if (session?.item_price) parts.push(`￥${session.item_price}`);
-    if (session?.order_status_name) parts.push(session.order_status_name);
+    if (itemContext?.item_title) parts.push(itemContext.item_title);
+    if (itemContext?.item_price) parts.push(`￥${itemContext.item_price}`);
+    if (itemContext?.order_status) parts.push(itemContext.order_status);
     if (session?.item_tips) parts.push(session.item_tips);
     headerMeta.textContent = parts.join(' · ');
 }
@@ -21608,11 +22433,13 @@ async function selectChatAccount(cookieId) {
     chatCurrentToUserId = '';
     chatCurrentSenderName = '';
     chatCurrentItemId = '';
+    chatCurrentItemContext = null;
     chatOldestMsgId = null;
     const placeholder = document.getElementById('chatMainPlaceholder');
     const active = document.getElementById('chatActiveArea');
     if (placeholder) placeholder.classList.remove('d-none');
     if (active) active.classList.add('d-none');
+    updateChatItemContext(null);
     hideReplyPanel();
     await refreshChatAccounts();
     await refreshChatSessions();
@@ -21666,6 +22493,17 @@ function buildChatSessionsFromOrdersData(orders, cookieId) {
             content: '',
             content_type: 1,
             item_id: order.item_id || '',
+            item_context: order.item_id ? {
+                item_id: order.item_id || '',
+                item_title: order.item_title || '',
+                item_price: order.item_price || order.amount || '',
+                item_image: order.item_image || '',
+                item_category: order.item_category || '',
+                item_detail_synced: Boolean(order.item_title || order.item_image),
+                order_status: order.order_status_name || order.order_status || '',
+                order_id: order.order_id || '',
+                order_updated_at: order.updated_at || '',
+            } : null,
             direction: 2,
             created_at: order.updated_at || order.platform_created_at || order.created_at || '',
         });
@@ -21771,6 +22609,7 @@ async function selectChatSession(session) {
     chatCurrentToUserId = session.buyer_id || (session.direction === 2 ? (session.sender_id || '') : '');
     chatCurrentSenderName = resolveSessionDisplayName(session);
     chatCurrentItemId = session.item_id || '';
+    chatCurrentItemContext = normalizeChatItemContext(session);
     chatOldestMsgId = null;
 
     const placeholder = document.getElementById('chatMainPlaceholder');
@@ -21781,6 +22620,7 @@ async function selectChatSession(session) {
     const headerName = document.getElementById('chatHeaderName');
     if (headerName) headerName.textContent = chatCurrentSenderName;
     updateChatHeaderMeta(session);
+    updateChatItemContext(session);
 
     renderChatSessions(chatSessionsCache);
     await loadChatMessages(false);
@@ -21802,7 +22642,12 @@ async function selectChatSession(session) {
             });
             if (messageWithItem) {
                 chatCurrentItemId = messageWithItem.item_id;
-                updateChatHeaderMeta({ ...session, item_id: chatCurrentItemId });
+                const messageContext = messageWithItem.item_context || result.item_context || { ...session, item_id: chatCurrentItemId };
+                updateChatHeaderMeta({ ...session, item_context: messageContext, item_id: chatCurrentItemId });
+                updateChatItemContext(messageContext);
+            } else if (result.item_context?.item_id) {
+                updateChatHeaderMeta({ ...session, item_context: result.item_context });
+                updateChatItemContext(result.item_context);
             }
         }
     } catch (error) {
@@ -21845,6 +22690,11 @@ async function loadChatMessages(append = false) {
         if (!result.success) {
             if (!append) area.innerHTML = '<div class="text-center text-muted py-4">加载失败</div>';
             return;
+        }
+        if (result.item_context?.item_id) {
+            const currentSession = chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {};
+            updateChatHeaderMeta({ ...currentSession, item_context: result.item_context });
+            updateChatItemContext(result.item_context);
         }
         const messages = result.messages || [];
         if (messages.length > 0) {

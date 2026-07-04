@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 闲鱼商品搜索模块
 基于 Playwright 实现真实的闲鱼商品搜索功能
@@ -765,6 +765,80 @@ class XianyuSearcher:
         except Exception as e:
             logger.warning(f"关闭商品搜索器浏览器时出错: {e}")
     
+    async def _dismiss_login_modal(self):
+        """Close or hide login overlays that can block search submission."""
+        if not self.page or self.page.is_closed():
+            return
+
+        try:
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+        close_selectors = [
+            ".ant-modal-close",
+            "button[aria-label='Close']",
+            "button[aria-label='close']",
+            ".login-modal-wrap--Tb8DyHnb .ant-modal-close",
+            ".ant-modal-wrap [class*='close']",
+        ]
+        for selector in close_selectors:
+            try:
+                close_button = self.page.locator(selector).first
+                if await close_button.is_visible(timeout=500):
+                    await close_button.click(force=True, timeout=1000)
+                    await asyncio.sleep(0.2)
+                    break
+            except Exception:
+                continue
+
+        try:
+            await self.page.evaluate("""
+                () => {
+                    document.querySelectorAll('.login-modal-wrap--Tb8DyHnb, .ant-modal-mask').forEach((el) => {
+                        el.style.display = 'none';
+                        el.style.pointerEvents = 'none';
+                    });
+                    document.body.classList.remove('ant-scrolling-effect');
+                    document.body.style.overflow = 'auto';
+                }
+            """)
+        except Exception:
+            pass
+
+    async def _submit_search(self, search_input):
+        """Submit search even when a login modal blocks the visible button."""
+        await self._dismiss_login_modal()
+
+        try:
+            await search_input.press("Enter")
+            await asyncio.sleep(0.8)
+            return
+        except Exception as enter_error:
+            logger.warning(f"Enter提交搜索失败，尝试点击按钮: {enter_error}")
+
+        await self._dismiss_login_modal()
+        try:
+            await self.page.locator('button[type="submit"]').first.click(force=True, timeout=5000)
+            await asyncio.sleep(0.8)
+            return
+        except Exception as click_error:
+            logger.warning(f"点击搜索按钮失败，尝试JS提交: {click_error}")
+
+        await self.page.evaluate("""
+            () => {
+                const input = document.querySelector('input[class*="search-input"], input[type="text"]');
+                const form = input ? input.closest('form') : document.querySelector('form');
+                if (form && typeof form.requestSubmit === 'function') {
+                    form.requestSubmit();
+                    return;
+                }
+                const button = document.querySelector('button[type="submit"]');
+                if (button) button.click();
+            }
+        """)
+        await asyncio.sleep(0.8)
     async def search_items(self, keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """
         搜索闲鱼商品 - 使用 Playwright 获取真实数据
@@ -862,7 +936,7 @@ class XianyuSearcher:
                 # 注册响应监听
                 self.page.on("response", on_response)
 
-                await self.page.click('button[type="submit"]')
+                await self._submit_search(search_input)
                                   
                 await self.page.wait_for_load_state("networkidle", timeout=15000)
 
@@ -1318,7 +1392,7 @@ class XianyuSearcher:
                 self.page.on("response", on_response)
 
                 logger.info("🖱️ 准备点击搜索按钮...")
-                await self.page.click('button[type="submit"]')
+                await self._submit_search(search_input)
                 logger.info("✅ 搜索按钮已点击")
                     
                 await self.page.wait_for_load_state("networkidle", timeout=15000)
@@ -1630,6 +1704,7 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         'total': 0,
         'error': "未知错误"
     }
+
 
 
 

@@ -60,6 +60,9 @@ Thumbs.db
 *~
 
 # Local environment files
+.env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 update_files.json
@@ -89,6 +92,7 @@ static/uploads/images/*
 !static/uploads/images/.gitkeep
 
 # 配置文件（包含敏感信息）
+global_config.yml
 config.local.yml
 global_config.local.yml
 
@@ -296,6 +300,7 @@ build/
 !CONTRIBUTING.md
 !SECURITY.md
 !LICENSE.md
+!TEAM_SYNC.md
 
 # 临时配置文件
 *.local.yml
@@ -304,7 +309,7 @@ build/
 tmp_remote_debug/
 debug_*.jpg
 config.*.yml
-!global_config.yml
+!global_config.example.yml
 
 # 开发工具配置
 .editorconfig
@@ -352,7 +357,7 @@ stats.log
 # 加密相关文件（保留项目核心文件，只忽略临时解密文件）
 # *_decrypted.py  # 注释掉，因为项目中有重要的解密文件
 # *_ultra.py      # 注释掉，因为项目中有重要的ultra文件
-secure_item_polish_ultra.py
+item_polish_module.py
 
 # 临时脚本文件
 temp_*.py
@@ -814,3 +819,12 @@ secure_confirm_ultra.py
 secure_freeshipping_ultra.py
 test_php_stats.py
 .playwright-browsers/
+
+# Local runtime secrets and heavy state
+trajectory_history/
+captcha_now.png
+captcha_test.png
+captcha_*.png
+captcha_verification.txt
+slider_debug/
+playwright/
